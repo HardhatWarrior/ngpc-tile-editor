@@ -9,6 +9,19 @@
   --bg:#1e1f26; --panel:#262832; --panel2:#2d3040; --border:#3a3d4d;
   --text:#e6e6ec; --dim:#9294a6; --accent:#5fb3ff; --accent2:#ff9f5f;
   --danger:#ff6b6b; --good:#5fe0a0;
+  --code-bg:#16171d; --code-text:#b7e6b0;
+  --canvas-bg:#202127; --checker:#2a2c36;
+}
+/* Light theme -- e-ink displays (this tool's own hosted use case) ghost badly on a dark UI and
+   waste the panel's grayscale/color range on near-black backgrounds; a light theme with strong,
+   saturated accents reads far better there. Toggled via #chkLightMode, same body-class + saved-
+   preference pattern as the hint toggle below. */
+body.light{
+  --bg:#f2f2ee; --panel:#ffffff; --panel2:#e7e7e1; --border:#c6c6bd;
+  --text:#1a1a17; --dim:#63635c; --accent:#0063c6; --accent2:#c1520a;
+  --danger:#c92a2a; --good:#1a8f4c;
+  --code-bg:#ffffff; --code-text:#1a1a17;
+  --canvas-bg:#dedecf; --checker:#cfcfc2;
 }
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
@@ -64,18 +77,18 @@ body.hideHints .hint:not(.statusText){display:none;}
 .projTab .closeTab:hover{opacity:1;background:rgba(255,107,107,0.25);}
 #bottom{grid-column:1/4;grid-row:3;}
 #canvasWrap{background:
-  linear-gradient(45deg,#2a2c36 25%,transparent 25%),
-  linear-gradient(-45deg,#2a2c36 25%,transparent 25%),
-  linear-gradient(45deg,transparent 75%,#2a2c36 75%),
-  linear-gradient(-45deg,transparent 75%,#2a2c36 75%);
+  linear-gradient(45deg,var(--checker) 25%,transparent 25%),
+  linear-gradient(-45deg,var(--checker) 25%,transparent 25%),
+  linear-gradient(45deg,transparent 75%,var(--checker) 75%),
+  linear-gradient(-45deg,transparent 75%,var(--checker) 75%);
   background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0px;
-  background-color:#202127;
+  background-color:var(--canvas-bg);
   border:1px solid var(--border);display:inline-block;line-height:0;border-radius:4px;
-  cursor:crosshair;
+  cursor:crosshair;touch-action:none;
 }
-#mainCanvas{image-rendering:pixelated;display:block;}
+#mainCanvas{image-rendering:pixelated;display:block;touch-action:none;}
 #refWrap{flex-shrink:0;margin-left:10px;}
-#refCanvas{image-rendering:pixelated;display:block;border:1px solid var(--border);border-radius:4px;background:#202127;}
+#refCanvas{image-rendering:pixelated;display:block;border:1px solid var(--border);border-radius:4px;background:var(--canvas-bg);}
 .toolgrid{display:grid;grid-template-columns:1fr 1fr;gap:4px;}
 .swatchRow{display:flex;gap:6px;}
 .swatch{width:34px;height:34px;border-radius:4px;border:2px solid var(--border);cursor:pointer;
@@ -94,7 +107,7 @@ body.hideHints .hint:not(.statusText){display:none;}
 .swatch .idx{position:absolute;bottom:1px;right:2px;font-size:9px;color:#fff;text-shadow:0 0 2px #000,0 0 2px #000;}
 .swatchLabel{font-size:10px;color:var(--dim);width:34px;text-align:center;}
 .slider-row{display:grid;grid-template-columns:16px 1fr 26px;align-items:center;gap:6px;}
-textarea{width:100%;background:#16171d;color:#b7e6b0;border:1px solid var(--border);
+textarea{width:100%;background:var(--code-bg);color:var(--code-text);border:1px solid var(--border);
   border-radius:4px;padding:8px;font:12px/1.4 Consolas,"Courier New",monospace;resize:vertical;}
 #codeOut{height:180px;}
 details>summary{cursor:pointer;user-select:none;color:var(--dim);font-size:11px;
@@ -162,6 +175,9 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
       <span class="sep"></span>
       <label class="chk" title="Hides every explanatory hint paragraph app-wide, keeping controls and live status text (selection info, zoom, tile counts, autosave) visible">
         <input type="checkbox" id="chkShowHints"> Show hints
+      </label>
+      <label class="chk" title="Light background + dark text, for e-ink displays (heavy full-page dark backgrounds ghost and refresh poorly there). Saved per-browser, same as Show Hints.">
+        <input type="checkbox" id="chkLightMode"> Light mode
       </label>
       <span class="sep"></span>
       <span class="hint statusText" id="autosaveHint">autosaved</span>
@@ -1169,11 +1185,19 @@ function onUp(){
   drawing=false;
   render();
 }
-canvas.addEventListener('mousedown',onDown);
+// Pointer Events (not mouse-only) so touch and stylus/pen input on Android/e-ink tablets get
+// continuous drag tracking too -- plain 'mouse*' events there only ever deliver a down+up pair
+// with no move events in between (the browser treats the drag as a page-scroll gesture instead),
+// which is what made drawing look like isolated clicks instead of a continuous stroke. Pointer
+// events unify mouse/touch/pen behind the same MouseEvent-compatible interface (.button/.buttons/
+// .clientX/.clientY all still work), so onDown/onMove/canvasToPixelCoord needed no changes --
+// only the listener names, plus touch-action:none in CSS so the browser doesn't intercept the
+// gesture for scrolling before it ever reaches these handlers.
+canvas.addEventListener('pointerdown',e=>{ e.preventDefault(); onDown(e); });
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
-window.addEventListener('mousemove',onMove);
-window.addEventListener('mouseup',onUp);
-canvas.addEventListener('mouseleave',()=>{document.getElementById('posInfo').textContent='—';});
+window.addEventListener('pointermove',onMove);
+window.addEventListener('pointerup',onUp);
+canvas.addEventListener('pointerleave',()=>{document.getElementById('posInfo').textContent='—';});
 
 /* ---------- selection / clipboard (active layer) ---------- */
 function selectionTileBounds(){
@@ -2005,6 +2029,18 @@ function setupHintToggle(){
     try{ localStorage.setItem('ngpc_tile_editor_show_hints', chk.checked?'1':'0'); }catch(e){}
   };
 }
+/* ---------- light-mode (e-ink) toggle -- same body-class + saved-preference pattern as hints ---------- */
+function setupLightModeToggle(){
+  const chk=document.getElementById('chkLightMode');
+  let light=false; // default OFF (this tool's original dark theme) unless a saved preference says on
+  try{ const saved=localStorage.getItem('ngpc_tile_editor_light_mode'); if(saved!==null) light=saved==='1'; }catch(e){}
+  chk.checked=light;
+  document.body.classList.toggle('light', light);
+  chk.onchange=()=>{
+    document.body.classList.toggle('light', chk.checked);
+    try{ localStorage.setItem('ngpc_tile_editor_light_mode', chk.checked?'1':'0'); }catch(e){}
+  };
+}
 
 /* ---------- sidebar / panel collapse ---------- */
 function updateAppGrid(){
@@ -2789,6 +2825,7 @@ function init(){
   renderAllPaletteUI();
   renderProjectTabs();
   setupHintToggle();
+  setupLightModeToggle();
   setupCollapsiblePanels();
   setupPanelReordering();
   updateAppGrid();
