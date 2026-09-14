@@ -167,7 +167,13 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
     <div class="row">
       <button id="btnImportPng">Import PNG</button>
       <input id="fileImportPng" type="file" accept="image/png" style="display:none">
-      <label class="chk" title="Only used by the 'Auto Palette Per Tile' import choice (and by Generate Palettes Per Tile below): caps how many new palettes it may create. If more distinct tile color-sets than this exist, the most similar ones are merged and affected tiles use the nearest surviving palette instead of their exact colors. Leave blank for no cap.">
+      <label class="chk" title="Resamples the raw source image to this percentage of its native size BEFORE any palette/quantization step runs (and before the tile-grid size is even decided) -- e.g. shrink a big photo to fit the tile budget, or enlarge a tiny sprite. 100 = original size. Applies to every import choice, including Full Color (No Palette).">
+        Import scale <input id="importScalePct" type="number" min="1" max="1000" step="1" value="100" style="width:52px">%
+      </label>
+      <label class="chk" title="Splits the import across two fresh layers, SCR_1 and SCR_2 (replacing whatever layers currently exist), so together they can show more colors per tile than one plane alone -- each tile's colors are split into two groups of up to 3, one per layer, with each layer transparent (index 0) wherever the OTHER layer is showing, so SCR_2 composites over SCR_1 for a richer image. Only affects the 'Extract New Palette' choice (one shared palette per layer) and 'Auto Palette Per Tile' (per-tile palettes per layer, honoring Max Palettes below, same as normal); 'Use Current Palette' and 'Full Color' ignore it.">
+        <input type="checkbox" id="chkTwoLayer"> Split into 2 layers (SCR_1/SCR_2)
+      </label>
+      <label class="chk" title="Only used by the 'Auto Palette Per Tile' import choice (and by Generate Palettes Per Tile below): caps how many new palettes it may create. If more distinct tile color-sets than this exist, the most similar ones are merged and affected tiles use the nearest surviving palette instead of their exact colors. Leave blank for no cap. Applies per-layer when Split into 2 Layers is also checked.">
         Max palettes <input id="importMaxPalettes" type="number" min="1" max="256" step="1" style="width:52px" placeholder="&#8734;">
       </label>
       <button id="btnGeneratePerTile" title="Converts the active layer's full-color reference (loaded via the 'Full Color (No Palette)' import choice) into real indexed art -- runs the same per-tile auto-palette logic as importing, using the Max Palettes cap above. If you have a tile-aligned Select-tool selection active, only those tiles are (re)generated -- everything else is left alone. The reference stays visible in a side panel afterward for comparison; re-run any time (e.g. after selecting a region to touch up) to regenerate just that area.">Generate Palettes Per Tile</button>
@@ -2416,19 +2422,27 @@ document.getElementById('btnClearRef').onclick=()=>{
   render(); scheduleAutosave();
 };
 async function importImage(img){
-  let tw=Math.ceil(img.width/TILE), th=Math.ceil(img.height/TILE);
+  const scalePct=clamp(parseFloat(document.getElementById('importScalePct').value)||100, 1, 1000);
+  const srcW=Math.max(1,Math.round(img.width*scalePct/100));
+  const srcH=Math.max(1,Math.round(img.height*scalePct/100));
+  let tw=Math.ceil(srcW/TILE), th=Math.ceil(srcH/TILE);
   let cropWarn='';
   if(tw>MAX_GRID_TILES || th>MAX_GRID_TILES){
-    cropWarn=`\n\nThis image is ${tw}x${th} tiles, larger than the ${MAX_GRID_TILES}x${MAX_GRID_TILES}-tile editing limit -- it will be cropped to the top-left ${Math.min(tw,MAX_GRID_TILES)}x${Math.min(th,MAX_GRID_TILES)} tiles.`;
+    cropWarn=`\n\nThis image is ${tw}x${th} tiles${scalePct!==100?' after scaling':''}, larger than the ${MAX_GRID_TILES}x${MAX_GRID_TILES}-tile editing limit -- it will be cropped to the top-left ${Math.min(tw,MAX_GRID_TILES)}x${Math.min(th,MAX_GRID_TILES)} tiles.`;
     tw=Math.min(tw,MAX_GRID_TILES); th=Math.min(th,MAX_GRID_TILES);
   }
   const w=tw*TILE, h=th*TILE;
   const off=document.createElement('canvas'); off.width=w; off.height=h;
   const octx=off.getContext('2d');
-  octx.drawImage(img,0,0); // drawing the full image onto a possibly-smaller canvas crops it to the top-left
+  octx.imageSmoothingEnabled = scalePct!==100; // only resample when actually scaling; keep a crisp 1:1 blit otherwise
+  octx.drawImage(img,0,0,srcW,srcH); // scales to srcW/srcH (if scalePct!=100) then crops to the top-left tile-aligned canvas
   const data=octx.getImageData(0,0,w,h).data;
 
-  const choice=await showModal('This will replace the active layer\'s content.'+cropWarn,[
+  const twoLayer=document.getElementById('chkTwoLayer').checked;
+  const replaceMsg = twoLayer
+    ? 'This will replace ALL layers with two fresh layers, SCR_1 and SCR_2.'
+    : 'This will replace the active layer\'s content.';
+  const choice=await showModal(replaceMsg+cropWarn,[
     {label:'Cancel Import',value:'cancel'},
     {label:'Use Current Palette',value:'current'},
     {label:'Extract New Palette',value:'extract',primary:true},
@@ -2436,56 +2450,212 @@ async function importImage(img){
     {label:'Full Color (No Palette)',value:'fullcolor'},
   ]);
   if(choice==='cancel') return;
+  const twoLayerActive = twoLayer && (choice==='extract' || choice==='pertile');
 
   let pal;
-  if(choice==='extract'){
+  if(choice==='extract' && !twoLayerActive){
     pal=extractPalette(data,w,h);
     state.paletteBank.push(mkPalette('imported',pal));
     state.activePalette=state.paletteBank.length-1;
   } else if(choice==='current'){
     pal=activePalette().colors;
   }
-  // 'pertile' needs no single `pal` -- it derives one 4-color palette per tile below.
+  // 'pertile'/2-layer need no single `pal` -- they derive their own palette(s) below.
   // 'fullcolor' needs no palette at all -- it just stores the raw image for later conversion.
 
   pushUndo();
   resizeAllLayersTo(tw, th, 'tl');
-  const layer=currentLayer();
-  layer.pixels=allocPixels(w,h);
-  layer.tilePalette=allocTilePalette(tw,th);
 
-  if(choice==='pertile'){
+  if(twoLayerActive){
+    state.layers=[makeLayer('SCR_1'), makeLayer('SCR_2')];
+    state.activeLayer=0;
+    const layerA=state.layers[0], layerB=state.layers[1];
     const maxRaw=document.getElementById('importMaxPalettes').value.trim();
     const maxPalettes = maxRaw==='' ? Infinity : Math.max(1,parseInt(maxRaw,10)||1);
-    const summary=applyPerTilePalettes(layer,data,w,h,tw,th,maxPalettes);
-    if(summary.overflowTiles>0 || summary.mergedGroups>0){
-      let msg=`Auto Palette Per Tile: added ${summary.newPalettes} new palette(s) (reused ${summary.reusedPalettes} already in the bank) covering ${summary.uniquePalettes} distinct color combination(s) across ${tw*th} tiles.`;
-      if(summary.overflowTiles>0) msg+=`\n\n${summary.overflowTiles} tile(s) had more than 3 unique opaque colors -- those were reduced to the 3 most-used colors in that tile, with the rest nearest-matched (index 0 is reserved for transparency, so a tile only has 3 usable colors on real hardware).`;
-      if(summary.mergedGroups>0) msg+=`\n\n${summary.mergedGroups} distinct tile color-set(s) were merged into the closest surviving palette to stay within your ${maxPalettes}-palette cap -- affected tiles now use that palette's nearest colors instead of their own exact colors.`;
+    if(choice==='pertile'){
+      const {dataA,dataB,overflowTiles:splitOverflowTiles}=splitPerTileIntoTwoBuffers(data,w,h,tw,th);
+      const sa=applyPerTilePalettes(layerA,dataA,w,h,tw,th,maxPalettes);
+      const sb=applyPerTilePalettes(layerB,dataB,w,h,tw,th,maxPalettes);
+      let msg=`2-Layer Auto Palette Per Tile across ${tw*th} tiles:\nSCR_1: ${sa.newPalettes} new + ${sa.reusedPalettes} reused palette(s) (${sa.uniquePalettes} distinct)\nSCR_2: ${sb.newPalettes} new + ${sb.reusedPalettes} reused palette(s) (${sb.uniquePalettes} distinct)`;
+      if(splitOverflowTiles>0) msg+=`\n\n${splitOverflowTiles} tile(s) had more than 6 total unique opaque colors (3 usable per layer, since index 0 stays reserved for transparency on each) -- extra colors were nearest-matched into the closest of the 6 chosen.`;
+      if(sa.mergedGroups>0 || sb.mergedGroups>0) msg+=`\n\n${sa.mergedGroups} SCR_1 / ${sb.mergedGroups} SCR_2 tile color-set(s) were merged to stay within your ${maxPalettes}-palette cap.`;
+      await modalAlert(msg);
+    } else {
+      const r=applyTwoLayerStandard(layerA,layerB,data,w,h);
+      let msg=`2-Layer Extract New Palette: SCR_1 got ${r.colorsACount} real color(s), SCR_2 got ${r.colorsBCount} real color(s) (3 usable per layer, index 0 reserved for transparency on each).`;
+      if(r.droppedColors>0) msg+=`\n\n${r.droppedColors} additional distinct color(s) in the source image were beyond the top 6 most-used across the whole image and got nearest-matched into the closest of the 6 chosen.`;
       await modalAlert(msg);
     }
-  } else if(choice==='fullcolor'){
-    layer.refRGBA=new Uint8ClampedArray(data);
-    layer.refConverted=false;
   } else {
-    if(choice==='extract') layer.defaultPalette=state.activePalette;
-    const pal255=pal.map(c=>[c.r*17,c.g*17,c.b*17]);
-    for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-      const o=(y*w+x)*4;
-      const a=data[o+3];
-      if(a<128){ setLayerPix(layer,x,y,0); continue; }
-      const r=data[o],g=data[o+1],b=data[o+2];
-      let best=0,bestD=Infinity;
-      for(let i=0;i<4;i++){
-        const dr=r-pal255[i][0], dg=g-pal255[i][1], db=b-pal255[i][2];
-        const d=dr*dr+dg*dg+db*db;
-        if(d<bestD){bestD=d;best=i;}
+    const layer=currentLayer();
+    layer.pixels=allocPixels(w,h);
+    layer.tilePalette=allocTilePalette(tw,th);
+    if(choice==='pertile'){
+      const maxRaw=document.getElementById('importMaxPalettes').value.trim();
+      const maxPalettes = maxRaw==='' ? Infinity : Math.max(1,parseInt(maxRaw,10)||1);
+      const summary=applyPerTilePalettes(layer,data,w,h,tw,th,maxPalettes);
+      if(summary.overflowTiles>0 || summary.mergedGroups>0){
+        let msg=`Auto Palette Per Tile: added ${summary.newPalettes} new palette(s) (reused ${summary.reusedPalettes} already in the bank) covering ${summary.uniquePalettes} distinct color combination(s) across ${tw*th} tiles.`;
+        if(summary.overflowTiles>0) msg+=`\n\n${summary.overflowTiles} tile(s) had more than 3 unique opaque colors -- those were reduced to the 3 most-used colors in that tile, with the rest nearest-matched (index 0 is reserved for transparency, so a tile only has 3 usable colors on real hardware).`;
+        if(summary.mergedGroups>0) msg+=`\n\n${summary.mergedGroups} distinct tile color-set(s) were merged into the closest surviving palette to stay within your ${maxPalettes}-palette cap -- affected tiles now use that palette's nearest colors instead of their own exact colors.`;
+        await modalAlert(msg);
       }
-      setLayerPix(layer,x,y,best);
+    } else if(choice==='fullcolor'){
+      layer.refRGBA=new Uint8ClampedArray(data);
+      layer.refConverted=false;
+    } else {
+      if(choice==='extract') layer.defaultPalette=state.activePalette;
+      const pal255=pal.map(c=>[c.r*17,c.g*17,c.b*17]);
+      for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+        const o=(y*w+x)*4;
+        const a=data[o+3];
+        if(a<128){ setLayerPix(layer,x,y,0); continue; }
+        const r=data[o],g=data[o+1],b=data[o+2];
+        let best=0,bestD=Infinity;
+        for(let i=0;i<4;i++){
+          const dr=r-pal255[i][0], dg=g-pal255[i][1], db=b-pal255[i][2];
+          const d=dr*dr+dg*dg+db*db;
+          if(d<bestD){bestD=d;best=i;}
+        }
+        setLayerPix(layer,x,y,best);
+      }
     }
   }
   selection=null;
   syncGridInputs(); renderAllPaletteUI(); render(); scheduleAutosave();
+}
+/* ---------- 2-layer (SCR_1/SCR_2) import helpers ---------- */
+function colorDistSq(a,b){ const dr=a.r-b.r,dg=a.g-b.g,db=a.b-b.b; return dr*dr+dg*dg+db*db; }
+/* Splits up to 6 {r,g,b,count} entries (4-bit) into two groups of at most 3 each: seeds with the
+   most different pair (max pairwise distance), then greedily assigns the rest to whichever seed
+   is nearer, redirecting to the other group once one side hits its cap of 3 -- since the input is
+   never more than 6 entries and both caps sum to 6, every entry always finds room somewhere. */
+function clusterColorsIntoTwoLayers(entries){
+  if(entries.length===0) return {a:[], b:[]};
+  if(entries.length===1) return {a:entries.slice(), b:[]};
+  let bi=0,bj=1,bd=-1;
+  for(let i=0;i<entries.length;i++)for(let j=i+1;j<entries.length;j++){
+    const d=colorDistSq(entries[i],entries[j]);
+    if(d>bd){bd=d;bi=i;bj=j;}
+  }
+  const groupA=[entries[bi]], groupB=[entries[bj]];
+  entries.forEach((e,idx)=>{
+    if(idx===bi||idx===bj) return;
+    const da=colorDistSq(e,entries[bi]), db=colorDistSq(e,entries[bj]);
+    if(da<=db){ if(groupA.length<3) groupA.push(e); else groupB.push(e); }
+    else { if(groupB.length<3) groupB.push(e); else groupA.push(e); }
+  });
+  return {a:groupA, b:groupB};
+}
+/* Pads a group's real colors to 3 (same deterministic filler as the per-tile algorithm), sorts
+   them by luminance for a canonical order, and prepends the reserved index-0 transparent slot --
+   returns both the final 4-entry `colors` array and a `map` from each real color's ORIGINAL
+   position in `group` to its final index (1-3), needed so per-pixel assignment lands on the right
+   index after padding/sorting reordered things. */
+function canonicalizeGroupColorsWithMap(group){
+  const real=group.map(e=>({r:e.r,g:e.g,b:e.b}));
+  while(real.length<3) real.push({r:(real.length+1)*4,g:(real.length+1)*4,b:(real.length+1)*4});
+  const withIdx=real.map((c,i)=>({c,i}));
+  withIdx.sort((x,y)=>(x.c.r+x.c.g+x.c.b)-(y.c.r+y.c.g+y.c.b));
+  const colors=[{r:0,g:0,b:0}];
+  const map=new Array(real.length);
+  withIdx.forEach((item,pos)=>{ colors.push(item.c); map[item.i]=pos+1; });
+  return {colors, map};
+}
+function pushOrReusePalette(colors,namePrefix){
+  const key=colors.map(c=>c.r+','+c.g+','+c.b).join('|');
+  for(let i=0;i<state.paletteBank.length;i++){
+    if(state.paletteBank[i].colors.map(c=>c.r+','+c.g+','+c.b).join('|')===key) return i;
+  }
+  state.paletteBank.push(mkPalette(namePrefix+state.paletteBank.length, colors));
+  return state.paletteBank.length-1;
+}
+/* Standard 2-layer import: ONE global palette per layer (mirrors "Extract New Palette", just
+   split across two planes). Histograms the whole image, keeps the 6 most-used colors, splits
+   them 3/3 across SCR_1/SCR_2, and nearest-matches every opaque pixel to whichever of those 6
+   colors is closest -- writing it into that pixel's position on its assigned layer and index 0
+   (transparent) at the same position on the OTHER layer, so SCR_2 shows through SCR_1 wherever
+   it has content and SCR_1 shows through where SCR_2 doesn't. */
+function applyTwoLayerStandard(layerA,layerB,data,w,h){
+  const hist=new Map();
+  for(let i=0;i<data.length;i+=4){
+    if(data[i+3]<128) continue;
+    const r=data[i]>>4, g=data[i+1]>>4, b=data[i+2]>>4;
+    const k=r+','+g+','+b;
+    const e=hist.get(k);
+    if(e) e.count++; else hist.set(k,{r,g,b,count:1});
+  }
+  const sortedAll=[...hist.values()].sort((a,b)=>b.count-a.count);
+  const top6=sortedAll.slice(0,6);
+  const droppedColors=Math.max(0,sortedAll.length-6);
+  const {a:groupA,b:groupB}=clusterColorsIntoTwoLayers(top6);
+  const {colors:colorsA,map:mapA}=canonicalizeGroupColorsWithMap(groupA);
+  const {colors:colorsB,map:mapB}=canonicalizeGroupColorsWithMap(groupB);
+  layerA.defaultPalette=pushOrReusePalette(colorsA,'scr1_');
+  layerB.defaultPalette=pushOrReusePalette(colorsB,'scr2_');
+
+  const tagged=[];
+  groupA.forEach((c,i)=>tagged.push({r:c.r,g:c.g,b:c.b,layer:'A',idx:mapA[i]}));
+  groupB.forEach((c,i)=>tagged.push({r:c.r,g:c.g,b:c.b,layer:'B',idx:mapB[i]}));
+
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    const o=(y*w+x)*4;
+    if(data[o+3]<128 || tagged.length===0){ setLayerPix(layerA,x,y,0); setLayerPix(layerB,x,y,0); continue; }
+    const r=data[o],g=data[o+1],b=data[o+2];
+    let best=tagged[0],bestD=Infinity;
+    tagged.forEach(t=>{
+      const dr=r-t.r*17, dg=g-t.g*17, db=b-t.b*17;
+      const d=dr*dr+dg*dg+db*db;
+      if(d<bestD){bestD=d;best=t;}
+    });
+    setLayerPix(layerA,x,y, best.layer==='A'?best.idx:0);
+    setLayerPix(layerB,x,y, best.layer==='B'?best.idx:0);
+  }
+  return {droppedColors, colorsACount:groupA.length, colorsBCount:groupB.length};
+}
+/* Per-tile 2-layer split: for each 8x8 tile independently, keeps its 6 most-used colors, splits
+   them 3/3 across two output RGBA buffers (same size as the source), and nearest-matches every
+   opaque pixel into whichever buffer its assigned color belongs to -- transparent (alpha 0) in
+   that pixel's position on the OTHER buffer, and on both if the source pixel itself was
+   transparent. The two buffers are then just ordinary (already ≤3-real-color-per-tile) images,
+   so the existing, already-tested applyPerTilePalettes runs on each completely unchanged. */
+function splitPerTileIntoTwoBuffers(data,w,h,tw,th){
+  const dataA=new Uint8ClampedArray(data.length);
+  const dataB=new Uint8ClampedArray(data.length);
+  let overflowTiles=0;
+  for(let ty=0;ty<th;ty++)for(let tx=0;tx<tw;tx++){
+    const x0=tx*TILE, y0=ty*TILE;
+    const hist=new Map();
+    for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++){
+      const o=((y0+y)*w+(x0+x))*4;
+      if(data[o+3]<128) continue;
+      const r=data[o]>>4, g=data[o+1]>>4, b=data[o+2]>>4;
+      const k=r+','+g+','+b;
+      const e=hist.get(k);
+      if(e) e.count++; else hist.set(k,{r,g,b,count:1});
+    }
+    const sorted=[...hist.values()].sort((a,b)=>b.count-a.count);
+    if(sorted.length>6) overflowTiles++;
+    const {a:groupA,b:groupB}=clusterColorsIntoTwoLayers(sorted.slice(0,6));
+    const tagged=[];
+    groupA.forEach(c=>tagged.push({r:c.r,g:c.g,b:c.b,layer:'A'}));
+    groupB.forEach(c=>tagged.push({r:c.r,g:c.g,b:c.b,layer:'B'}));
+    for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++){
+      const px=x0+x, py=y0+y;
+      const o=(py*w+px)*4;
+      if(data[o+3]<128 || tagged.length===0){ dataA[o+3]=0; dataB[o+3]=0; continue; }
+      const r=data[o],g=data[o+1],b=data[o+2];
+      let best=tagged[0],bestD=Infinity;
+      tagged.forEach(t=>{
+        const dr=r-t.r*17, dg=g-t.g*17, db=b-t.b*17;
+        const d=dr*dr+dg*dg+db*db;
+        if(d<bestD){bestD=d;best=t;}
+      });
+      if(best.layer==='A'){ dataA[o]=r;dataA[o+1]=g;dataA[o+2]=b;dataA[o+3]=255; dataB[o+3]=0; }
+      else { dataB[o]=r;dataB[o+1]=g;dataB[o+2]=b;dataB[o+3]=255; dataA[o+3]=0; }
+    }
+  }
+  return {dataA,dataB,overflowTiles};
 }
 /* Per-tile auto palette: for each 8x8 tile, pick the up-to-3 most-used opaque colors as that
    tile's own palette (canonicalized by luminance-sorted order so identical color sets across
