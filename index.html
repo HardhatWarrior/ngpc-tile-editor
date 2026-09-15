@@ -1204,6 +1204,15 @@ function onMove(evt){
   }
 }
 function onUp(){
+  // onUp is bound to `window` (needed so a drag that ends outside the canvas still gets
+  // cleaned up), so it fires for EVERY pointer release anywhere on the whole page -- including
+  // clicking a button in a sidebar panel. The unconditional render() at the end used to run
+  // every single time regardless, which rebuilds panels like the Tile Groups list from scratch
+  // (see renderGroupList(), called from render()) and so was destroying/recreating buttons
+  // (e.g. a group's own delete ×) between their pointerdown and the synthesized click event --
+  // the click event target no longer existed by the time it would fire, so the click silently
+  // did nothing. Only re-render when this pointer-up is actually concluding a canvas gesture.
+  const wasDrawing=drawing;
   if(drawing && tool==='pencil') scheduleAutosave();
   if(drawing && (tool==='line'||tool==='rect'||tool==='ellipse') && shapeStart && shapeEnd){
     pushUndo();
@@ -1245,7 +1254,7 @@ function onUp(){
   selMoving=false; selMoveStart=null;
   wandMoving=false; wandMoveStart=null;
   drawing=false;
-  render();
+  if(wasDrawing) render();
 }
 // Pointer Events (not mouse-only) so touch and stylus/pen input on Android/e-ink tablets get
 // continuous drag tracking too -- plain 'mouse*' events there only ever deliver a down+up pair
