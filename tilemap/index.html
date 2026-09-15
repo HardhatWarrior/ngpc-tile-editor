@@ -122,7 +122,7 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
   <div id="left">
     <div class="panel">
       <h2>Tileset</h2>
-      <div class="hint">Import a project <code>.json</code> saved from the NGPC Tile Editor. Each source layer becomes one paired map layer (e.g. SCR_1 + SCR_2). Click a tile below, or drag to select a rectangular block of tiles to stamp as one unit.</div>
+      <div class="hint">Import a project <code>.json</code> saved from the NGPC Tile Editor. Pick which tileset layer to stamp FROM with the tabs below, independent of which map layer (SCR_1/SCR_2) you're stamping ONTO. Click a tile below, or drag to select a rectangular block of tiles to stamp as one unit.</div>
       <div class="row" style="margin-top:6px" id="tilesetLayerTabs"></div>
       <div class="row" style="margin-top:6px;align-items:flex-start">
         <canvas id="tilesetCanvas" width="128" height="128"></canvas>
@@ -154,9 +154,10 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
         <button id="toolErase" title="Erase (E)">&#9003; Erase</button>
         <button id="toolFill" title="Flood fill (F)">&#129691; Fill</button>
         <button id="toolEyedrop" title="Eyedrop (I)">&#128167; Pick</button>
-        <button id="toolSelect" title="Rectangle select (S)">&#9645; Select</button>
+        <button id="toolSelect" title="Rectangle select (S) -- drag from inside an existing selection to move it">&#9645; Select</button>
+        <button id="toolSprite" title="Sprite preview placement (P)">&#128100; Sprite</button>
       </div>
-      <div class="hint" style="margin-top:4px">Stamp/Erase place the whole selected tile block. Fill and Eyedrop always work on a single cell (Fill uses just the block's top-left tile).</div>
+      <div class="hint" style="margin-top:4px">Stamp/Erase place the whole selected tile block. Fill and Eyedrop always work on a single cell (Fill uses just the block's top-left tile). Select: drag to define a rectangle, drag again from inside it to move its content. Sprite: click empty space to place a preview-only sprite from the current stamp block, drag an existing one to move it.</div>
       <div class="row" style="margin-top:6px">
         <button id="btnCopy">Copy</button>
         <button id="btnCut">Cut</button>
@@ -187,7 +188,24 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
     <div class="panel">
       <h2>Map Layers</h2>
       <div class="layerList" id="mapLayerList"></div>
-      <div class="hint" style="margin-top:4px">One per imported tileset layer, in the same stacking order (last = front, matching SCR2-over-SCR1).</div>
+      <div class="hint" style="margin-top:4px">Always exactly SCR_1 (back) and SCR_2 (front), regardless of how many tileset layers are imported -- each cell remembers which tileset layer its tile came from.</div>
+    </div>
+
+    <div class="panel">
+      <h2>Sprite Preview Layer</h2>
+      <div class="hint">Preview only -- placed sprites are <strong>not</strong> included in the C export. Uses whatever tile block is currently selected in the Stamp panel. Sprites are a free-floating list, not a grid, so they can overlap each other and the map without erasing anything.</div>
+      <div class="row" style="margin-top:6px">
+        <label class="chk">New sprite priority
+          <select id="spritePriority" style="width:180px">
+            <option value="behind">Behind both planes (SPR_BEHIND)</option>
+            <option value="middle">Between SCR_1 and SCR_2 (SPR_MIDDLE)</option>
+            <option value="front" selected>In front of everything (SPR_FRONT)</option>
+          </select>
+        </label>
+      </div>
+      <label class="chk" style="margin-top:6px"><input type="checkbox" id="chkSpritesVisible" checked> Show sprite layer</label>
+      <div class="layerList" id="spriteList" style="margin-top:6px"></div>
+      <div class="hint statusText" id="spriteInfo" style="margin-top:4px">No sprites placed.</div>
     </div>
 
     <div class="panel">
@@ -290,40 +308,70 @@ let tool='stamp';
 let drawing=false, drawButton=0;
 let selection=null; // {x0,y0,x1,y1} map-cell coords, inclusive
 let dragStartCell=null;
-let clipboard=null; // {w,h,tileId:Int16Array,pal:Int16Array,flip:Uint8Array}
+let clipboard=null; // {w,h,tileId:Int16Array,pal:Int16Array,srcLayer:Int16Array,flip:Uint8Array}
 let undoStack=[], redoStack=[];
 const UNDO_LIMIT=60;
 let zoom=18;
+// Move-existing-selection state (tool==='select', dragging from inside the current selection
+// instead of defining a new one) -- mirrors the Tile Editor's own click-inside-selection-to-move.
+let moveBuffer=null; // {w,h,tileId,pal,srcLayer,flip} extracted from the layer at drag start
+let moveOrigin=null; // {x,y} top-left the block was extracted from
+let moveDragStart=null; // {x,y} cell where the move-drag started
+let moveOffset={dx:0,dy:0};
+// Sprite preview layer -- placed instances are a flat list, not a grid, so they can freely overlap.
+let selectedSpriteIdx=-1;
+let moveSpriteActive=null; // {idx,x,y} while dragging an existing sprite instance
+let spriteDragStart=null; // {x,y} cell where a sprite move-drag started
+let spritePriority='front'; // priority applied to the NEXT placed sprite
 
 function mapW(){ return mapState.mapW; }
 function mapH(){ return mapState.mapH; }
 function currentMapLayer(){ return mapState.layers[activeMapLayer]; }
 function tilesetLayer(i){ return tileset.layers[i]; }
 
+// Every map cell remembers WHICH tileset layer its tile came from (srcLayer), not just a tile
+// index -- this decouples the 2 fixed map planes (SCR_1/SCR_2) from however many tileset layers
+// happen to be imported, so either plane can freely mix tiles from any tileset layer.
 function makeMapLayer(name,w,h){
   return { name, visible:true,
     tileId:new Int16Array(w*h).fill(-1),
+    srcLayer:new Int16Array(w*h).fill(-1), // tileset.layers[] index this cell's tile came from, -1=empty
     pal:new Int16Array(w*h).fill(-1),
     flip:new Uint8Array(w*h) };
 }
 function resizeMapTo(newW,newH){
   const oldW=mapState.mapW, oldH=mapState.mapH;
   mapState.layers.forEach(layer=>{
-    const nt=new Int16Array(newW*newH).fill(-1), np=new Int16Array(newW*newH).fill(-1), nf=new Uint8Array(newW*newH);
+    const nt=new Int16Array(newW*newH).fill(-1), ns=new Int16Array(newW*newH).fill(-1),
+          np=new Int16Array(newW*newH).fill(-1), nf=new Uint8Array(newW*newH);
     for(let y=0;y<Math.min(oldH,newH);y++)for(let x=0;x<Math.min(oldW,newW);x++){
       const so=y*oldW+x, dO=y*newW+x;
-      nt[dO]=layer.tileId[so]; np[dO]=layer.pal[so]; nf[dO]=layer.flip[so];
+      nt[dO]=layer.tileId[so]; ns[dO]=layer.srcLayer[so]; np[dO]=layer.pal[so]; nf[dO]=layer.flip[so];
     }
-    layer.tileId=nt; layer.pal=np; layer.flip=nf;
+    layer.tileId=nt; layer.srcLayer=ns; layer.pal=np; layer.flip=nf;
   });
   mapState.mapW=newW; mapState.mapH=newH;
+}
+// Fills in srcLayer for map data saved before this field existed: assumes the old rigid 1:1
+// map-layer<->tileset-layer pairing that was in effect at the time (map layer i <- tileset layer i).
+function normalizeLoadedLayers(rawLayers,w,h){
+  const base=rawLayers.map((l,i)=>{
+    const tileId=Int16Array.from(l.tileId);
+    const srcLayer = l.srcLayer ? Int16Array.from(l.srcLayer) : tileId.map(t=>t>=0?i:-1);
+    return { name:l.name, visible:l.visible!==false, tileId, srcLayer,
+      pal:Int16Array.from(l.pal), flip:Uint8Array.from(l.flip) };
+  });
+  while(base.length<2) base.push(makeMapLayer(base.length===0?'SCR_1':'SCR_2',w,h));
+  return base;
 }
 
 /* ---------- undo/redo ---------- */
 function snapshotMap(){
   return { mapW:mapState.mapW, mapH:mapState.mapH,
     layers: mapState.layers.map(l=>({name:l.name,visible:l.visible,
-      tileId:l.tileId.slice(), pal:l.pal.slice(), flip:l.flip.slice()})) };
+      tileId:l.tileId.slice(), srcLayer:l.srcLayer.slice(), pal:l.pal.slice(), flip:l.flip.slice()})),
+    sprites: mapState.sprites.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,srcLayer:s.srcLayer,priority:s.priority,
+      cells:s.cells.map(c=>({...c}))})) };
 }
 function pushUndo(){
   undoStack.push(snapshotMap());
@@ -333,25 +381,31 @@ function pushUndo(){
 function applySnapshot(s){
   mapState.mapW=s.mapW; mapState.mapH=s.mapH;
   mapState.layers=s.layers.map(l=>({name:l.name,visible:l.visible,
-    tileId:l.tileId.slice(), pal:l.pal.slice(), flip:l.flip.slice()}));
+    tileId:l.tileId.slice(), srcLayer:l.srcLayer.slice(), pal:l.pal.slice(), flip:l.flip.slice()}));
+  mapState.sprites=s.sprites.map(spr=>({x:spr.x,y:spr.y,w:spr.w,h:spr.h,srcLayer:spr.srcLayer,priority:spr.priority,
+    cells:spr.cells.map(c=>({...c}))}));
   activeMapLayer=clamp(activeMapLayer,0,mapState.layers.length-1);
-  syncMapInputs(); renderAllLayerUI(); render(); scheduleAutosave();
+  selectedSpriteIdx=-1;
+  syncMapInputs(); renderAllLayerUI(); renderSpriteList(); render(); scheduleAutosave();
 }
 function undo(){ if(!undoStack.length)return; redoStack.push(snapshotMap()); applySnapshot(undoStack.pop()); }
 function redo(){ if(!redoStack.length)return; undoStack.push(snapshotMap()); applySnapshot(redoStack.pop()); }
 
 /* ---------- New / reset ---------- */
+// The map ALWAYS has exactly 2 planes (SCR_1, SCR_2), regardless of how many layers the imported
+// tileset has -- each map cell records its OWN srcLayer, so either plane can freely mix tiles
+// pulled from any tileset layer.
 function freshMap(w,h){
-  const n=tileset?tileset.layers.length:1;
   return { name:'my_map', mapW:w, mapH:h,
-    layers: Array.from({length:n},(_,i)=>makeMapLayer(tileset?tileset.layers[i].name:'Layer '+(i+1),w,h)) };
+    layers: [makeMapLayer('SCR_1',w,h), makeMapLayer('SCR_2',w,h)],
+    sprites: [] };
 }
 document.getElementById('btnNewMap').onclick=async ()=>{
   const ok=await modalConfirm('Start a new blank map at 32x32 tiles? Unsaved changes will be lost.');
   if(!ok) return;
   mapState=freshMap(32,32);
-  activeMapLayer=0; selection=null; undoStack.length=0; redoStack.length=0;
-  syncMapInputs(); renderAllLayerUI(); render(); scheduleAutosave();
+  activeMapLayer=0; selection=null; selectedSpriteIdx=-1; undoStack.length=0; redoStack.length=0;
+  syncMapInputs(); renderAllLayerUI(); renderSpriteList(); render(); scheduleAutosave();
 };
 
 /* ---------- import tileset (reads an NGPC Tile Editor project .json) ---------- */
@@ -390,23 +444,26 @@ async function importTileset(obj, fileName){
     }
     return {name:l.name, tileGridW:gw, tileGridH:gh, tiles};
   });
-  const ok = tileset ? await modalConfirm('Importing will replace the current tileset. Existing map cells that reference tiles/palettes from the OLD tileset will now point at whatever ends up at those same index numbers in the new one -- re-check your map after importing.') : true;
-  if(!ok) return;
-  tileset={ sourceName: fileName, paletteBank, layers };
-  activeTilesetLayer=0;
-  stampSel=null;
-  if(!mapState){
-    mapState=freshMap(32,32);
-  } else if(mapState.layers.length!==layers.length){
-    const ok2=await modalConfirm(`The new tileset has ${layers.length} layer(s) but the current map has ${mapState.layers.length}. Rebuild the map's layers to match (existing map cell content is lost)?`);
-    if(ok2){
-      mapState.layers=layers.map((l,i)=>makeMapLayer(l.name, mapState.mapW, mapState.mapH));
-      activeMapLayer=0;
-    }
-  } else {
-    mapState.layers.forEach((ml,i)=>{ ml.name=layers[i].name; });
+  let mode='replace';
+  if(tileset){
+    mode=await showModal('A tileset is already imported. Replace it entirely, or append this file\'s layers to the end of the current layer list (existing map cells keep pointing at their original layers either way)?',
+      [{label:'Cancel',value:'cancel'},{label:'Append',value:'append'},{label:'Replace',value:'replace',primary:true}]);
+    if(mode==='cancel'||mode===false) return;
   }
-  document.getElementById('tilesetInfo').textContent=`${fileName}: ${layers.length} layer(s), ${gw}x${gh} tiles each, ${paletteBank.length} palette(s)`;
+  if(mode==='append'){
+    const palOffset=tileset.paletteBank.length;
+    const offsetLayers=layers.map(l=>({...l, tiles:l.tiles.map(t=>({pixels:t.pixels, defaultPalette:t.defaultPalette+palOffset}))}));
+    tileset.paletteBank=tileset.paletteBank.concat(paletteBank);
+    tileset.layers=tileset.layers.concat(offsetLayers);
+    tileset.sourceName=tileset.sourceName+' + '+fileName;
+    activeTilesetLayer=tileset.layers.length-layers.length;
+  } else {
+    tileset={ sourceName: fileName, paletteBank, layers };
+    activeTilesetLayer=0;
+  }
+  stampSel=null;
+  if(!mapState) mapState=freshMap(32,32);
+  document.getElementById('tilesetInfo').textContent=`${tileset.sourceName}: ${tileset.layers.length} layer(s) total, ${paletteBank.length===tileset.paletteBank.length?paletteBank.length:tileset.paletteBank.length} palette(s) total`;
   renderTilesetLayerTabs();
   renderStampPaletteOptions();
   renderAllLayerUI();
@@ -425,7 +482,7 @@ function renderTilesetLayerTabs(){
     const b=document.createElement('button');
     b.textContent=l.name;
     b.className=(i===activeTilesetLayer)?'active':'';
-    b.onclick=()=>{ activeTilesetLayer=i; activeMapLayer=Math.min(activeMapLayer,mapState.layers.length-1); stampSel=null; renderTilesetLayerTabs(); renderAllLayerUI(); renderTilesetCanvas(); renderStampPreview(); updateTileInfo(); };
+    b.onclick=()=>{ activeTilesetLayer=i; stampSel=null; renderTilesetLayerTabs(); renderTilesetCanvas(); renderStampPreview(); updateTileInfo(); };
     wrap.appendChild(b);
   });
 }
@@ -563,7 +620,7 @@ function renderAllLayerUI(){
     row.className='layerRow'+(i===activeMapLayer?' active':'');
     row.innerHTML=`<input type="checkbox" ${l.visible?'checked':''}> <span style="flex:1">${l.name}</span>`;
     row.querySelector('input').onclick=e=>{ e.stopPropagation(); l.visible=e.target.checked; render(); scheduleAutosave(); };
-    row.onclick=()=>{ activeMapLayer=i; activeTilesetLayer=Math.min(i,tileset?tileset.layers.length-1:0); stampSel=null; renderAllLayerUI(); renderTilesetLayerTabs(); renderTilesetCanvas(); renderStampPreview(); updateTileInfo(); renderBudget(); render(); };
+    row.onclick=()=>{ activeMapLayer=i; renderAllLayerUI(); renderBudget(); render(); };
     wrap.appendChild(row);
   });
   renderBudget();
@@ -575,8 +632,10 @@ function renderBudget(){
     const usedTiles=new Set(); const usedPals=new Set();
     for(let k=0;k<l.tileId.length;k++){
       const t=l.tileId[k]; if(t<0) continue;
-      usedTiles.add(t);
-      const p = l.pal[k]>=0 ? l.pal[k] : (tileset && tileset.layers[i] ? tileset.layers[i].tiles[t].defaultPalette : 0);
+      const sl=l.srcLayer[k];
+      usedTiles.add(sl+':'+t); // distinct tileset layers can reuse the same numeric tile index
+      const srcTileset = tileset && tileset.layers[sl];
+      const p = l.pal[k]>=0 ? l.pal[k] : (srcTileset ? srcTileset.tiles[t].defaultPalette : 0);
       usedPals.add(p);
     }
     const tOver = usedTiles.size>FREE_TILE_SLOTS, pOver = usedPals.size>MAX_PALETTES_PER_PLANE;
@@ -587,6 +646,41 @@ function renderBudget(){
   });
   el.innerHTML=lines.join('<br>');
 }
+
+/* ---------- sprite preview layer list ---------- */
+function renderSpriteList(){
+  const wrap=document.getElementById('spriteList');
+  wrap.innerHTML='';
+  const info=document.getElementById('spriteInfo');
+  if(!mapState || !mapState.sprites.length){ info.textContent='No sprites placed.'; return; }
+  info.textContent=`${mapState.sprites.length} sprite instance(s).`;
+  mapState.sprites.forEach((spr,i)=>{
+    const row=document.createElement('div');
+    row.className='layerRow'+(i===selectedSpriteIdx?' active':'');
+    row.innerHTML=`<span style="flex:1">#${i} ${spr.w}x${spr.h} @ (${spr.x},${spr.y})</span>`;
+    const sel=document.createElement('select');
+    sel.innerHTML='<option value="behind">Behind both</option><option value="middle">Between</option><option value="front">Front</option>';
+    sel.value=spr.priority;
+    sel.onclick=e=>e.stopPropagation();
+    sel.onchange=e=>{ spr.priority=e.target.value; render(); scheduleAutosave(); };
+    row.appendChild(sel);
+    const del=document.createElement('button');
+    del.textContent='×'; del.title='Delete this sprite';
+    del.onclick=e=>{ e.stopPropagation(); deleteSprite(i); };
+    row.appendChild(del);
+    row.onclick=()=>{ selectedSpriteIdx=i; renderSpriteList(); render(); };
+    wrap.appendChild(row);
+  });
+}
+function deleteSprite(i){
+  pushUndo();
+  mapState.sprites.splice(i,1);
+  if(selectedSpriteIdx===i) selectedSpriteIdx=-1;
+  else if(selectedSpriteIdx>i) selectedSpriteIdx--;
+  renderSpriteList(); render(); scheduleAutosave();
+}
+document.getElementById('spritePriority').onchange=e=>{ spritePriority=e.target.value; };
+document.getElementById('chkSpritesVisible').onchange=render;
 
 /* ---------- map grid size ---------- */
 function syncMapInputs(){
@@ -602,7 +696,8 @@ document.getElementById('btnResizeMap').onclick=()=>{
   pushUndo();
   resizeMapTo(nw,nh);
   selection=null;
-  syncMapInputs(); render(); scheduleAutosave();
+  mapState.sprites.forEach(s=>{ s.x=clamp(s.x,0,Math.max(0,nw-s.w)); s.y=clamp(s.y,0,Math.max(0,nh-s.h)); });
+  syncMapInputs(); renderSpriteList(); render(); scheduleAutosave();
 };
 
 /* ---------- render map canvas ---------- */
@@ -625,22 +720,50 @@ function render(){
   ctx.clearRect(0,0,canvas.width,canvas.height);
   const transPrev=document.getElementById('chkTransparentPreview').checked;
 
-  mapState.layers.forEach((layer,li)=>{
+  function drawMapLayer(layer,li){
     if(!layer.visible) return;
     ctx.globalAlpha=(li===activeMapLayer)?1:0.35;
-    const srcLayer = tileset ? tileset.layers[li] : null;
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){
       const idx=y*w+x;
       const t=layer.tileId[idx];
       if(t<0){ continue; } // empty cell -- always shows backdrop/layer-below regardless of transPrev
-      if(!srcLayer || !srcLayer.tiles[t]) continue;
-      const tile=srcLayer.tiles[t];
+      const sl = tileset ? tileset.layers[layer.srcLayer[idx]] : null;
+      if(!sl || !sl.tiles[t]) continue;
+      const tile=sl.tiles[t];
       const palIdx = layer.pal[idx]>=0 ? layer.pal[idx] : tile.defaultPalette;
       const pal=tileset.paletteBank[palIdx]||tileset.paletteBank[0];
       const flipH=!!(layer.flip[idx]&1), flipV=!!(layer.flip[idx]&2);
       drawTileAt(ctx, tile, pal, flipH, flipV, x*TILE*zoom, y*TILE*zoom, zoom);
     }
-  });
+  }
+  // Sprite preview layer: real hardware OAM priority bits give exactly 3 z-order slots relative to
+  // the 2 fixed scroll planes -- behind both, between them, or in front of everything. Sprites are
+  // a separate list (not a grid), so placements can freely overlap each other and the map.
+  function drawSpriteGroup(prio){
+    if(!document.getElementById('chkSpritesVisible').checked) return;
+    ctx.globalAlpha=1;
+    mapState.sprites.forEach((spr,si)=>{
+      if(spr.priority!==prio) return;
+      const sl = tileset ? tileset.layers[spr.srcLayer] : null;
+      if(!sl) return;
+      const sx = (moveSpriteActive && moveSpriteActive.idx===si) ? moveSpriteActive.x : spr.x;
+      const sy = (moveSpriteActive && moveSpriteActive.idx===si) ? moveSpriteActive.y : spr.y;
+      spr.cells.forEach((cell,ci)=>{
+        const cx=ci%spr.w, cy=Math.floor(ci/spr.w);
+        const tile=sl.tiles[cell.tileIdx]; if(!tile) return;
+        const pal=tileset.paletteBank[cell.palIdx]||tileset.paletteBank[0];
+        drawTileAt(ctx, tile, pal, cell.flipH, cell.flipV, (sx+cx)*TILE*zoom, (sy+cy)*TILE*zoom, zoom);
+      });
+      if(si===selectedSpriteIdx || (moveSpriteActive&&moveSpriteActive.idx===si)){
+        ctx.save(); ctx.strokeStyle='#ff9f5f'; ctx.lineWidth=2;
+        ctx.strokeRect(sx*TILE*zoom+1, sy*TILE*zoom+1, spr.w*TILE*zoom-2, spr.h*TILE*zoom-2);
+        ctx.restore();
+      }
+    });
+  }
+  drawSpriteGroup('behind');
+  mapState.layers.forEach((layer,li)=>{ drawMapLayer(layer,li); if(li===0) drawSpriteGroup('middle'); });
+  drawSpriteGroup('front');
   ctx.globalAlpha=1;
 
   // grid lines
@@ -653,15 +776,30 @@ function render(){
     ctx.strokeRect(1,1,Math.min(32,w)*TILE*zoom-2,Math.min(32,h)*TILE*zoom-2);
     ctx.setLineDash([]);
   }
-  // selection
-  if(selection){
+  // moving-selection ghost -- shows the extracted block following the drag before it's dropped
+  if(moveBuffer){
+    const mx=clamp(moveOrigin.x+moveOffset.dx,0,w-moveBuffer.w), my=clamp(moveOrigin.y+moveOffset.dy,0,h-moveBuffer.h);
+    ctx.save(); ctx.globalAlpha=0.85;
+    for(let ry=0;ry<moveBuffer.h;ry++)for(let rx=0;rx<moveBuffer.w;rx++){
+      const si=ry*moveBuffer.w+rx;
+      const t=moveBuffer.tileId[si]; if(t<0) continue;
+      const sl=tileset?tileset.layers[moveBuffer.srcLayer[si]]:null; if(!sl||!sl.tiles[t]) continue;
+      const palIdx=moveBuffer.pal[si]>=0?moveBuffer.pal[si]:sl.tiles[t].defaultPalette;
+      const pal=tileset.paletteBank[palIdx]||tileset.paletteBank[0];
+      const flipH=!!(moveBuffer.flip[si]&1), flipV=!!(moveBuffer.flip[si]&2);
+      drawTileAt(ctx, sl.tiles[t], pal, flipH, flipV, (mx+rx)*TILE*zoom, (my+ry)*TILE*zoom, zoom);
+    }
+    ctx.strokeStyle='#5fb3ff'; ctx.lineWidth=2; ctx.setLineDash([6,4]);
+    ctx.strokeRect(mx*TILE*zoom+1, my*TILE*zoom+1, moveBuffer.w*TILE*zoom-2, moveBuffer.h*TILE*zoom-2);
+    ctx.restore();
+  } else if(selection){
     const sx=selection.x0*TILE*zoom, sy=selection.y0*TILE*zoom;
     const sw=(selection.x1-selection.x0+1)*TILE*zoom, sh=(selection.y1-selection.y0+1)*TILE*zoom;
     ctx.save(); ctx.strokeStyle='#5fb3ff'; ctx.lineWidth=2; ctx.setLineDash([6,4]);
     ctx.strokeRect(sx+1,sy+1,sw-2,sh-2); ctx.restore();
   }
-  // stamp hover ghost -- shows where a (possibly multi-tile) stamp would land before you click
-  if(tool==='stamp' && stampHoverCell && stampSel && !drawing){
+  // stamp/sprite hover ghost -- shows where a (possibly multi-tile) block would land before you click
+  if((tool==='stamp'||tool==='sprite') && stampHoverCell && stampSel && !drawing && !moveSpriteActive){
     const rc=resolvedStampCells();
     const srcLayer=tilesetLayer(activeTilesetLayer);
     ctx.save(); ctx.globalAlpha=0.55;
@@ -704,6 +842,7 @@ function stampAt(x,y){
     const {palIdx}=resolveCellPalette(tile);
     const idx=cellIndex(dx,dy);
     layer.tileId[idx]=cell.tileIdx;
+    layer.srcLayer[idx]=activeTilesetLayer;
     layer.pal[idx]=palIdx;
     layer.flip[idx]=(cell.flipH?1:0)|(cell.flipV?2:0);
   }
@@ -712,15 +851,20 @@ function eraseAt(x,y){
   if(!inBounds(x,y)) return;
   const layer=currentMapLayer();
   const idx=cellIndex(x,y);
-  layer.tileId[idx]=-1; layer.pal[idx]=-1; layer.flip[idx]=0;
+  layer.tileId[idx]=-1; layer.srcLayer[idx]=-1; layer.pal[idx]=-1; layer.flip[idx]=0;
 }
 // Eyedrop always picks up a SINGLE cell (that's all a map cell can hold) into a fresh 1x1 stamp.
+// The cell's OWN srcLayer is used (not whatever tileset tab happens to be open) since a plane can
+// hold tiles from multiple tileset layers.
 function eyedropAt(x,y){
   if(!inBounds(x,y)) return;
   const layer=currentMapLayer();
   const idx=cellIndex(x,y);
   const t=layer.tileId[idx];
   if(t<0) return;
+  const sl=layer.srcLayer[idx];
+  if(!tileset || !tileset.layers[sl]) return;
+  activeTilesetLayer=sl;
   const srcLayer=tilesetLayer(activeTilesetLayer);
   const tx=t%srcLayer.tileGridW, ty=Math.floor(t/srcLayer.tileGridW);
   stampSel={x0:tx,y0:ty,x1:tx,y1:ty};
@@ -728,16 +872,17 @@ function eyedropAt(x,y){
   document.getElementById('btnFlipH').classList.toggle('active',currentFlipH);
   document.getElementById('btnFlipV').classList.toggle('active',currentFlipV);
   document.getElementById('stampPalOverride').value = layer.pal[idx]>=0 ? String(layer.pal[idx]) : '-1';
-  renderTilesetCanvas(); renderStampPreview(); updateTileInfo();
+  renderTilesetLayerTabs(); renderTilesetCanvas(); renderStampPreview(); updateTileInfo();
 }
 // Fill only ever places a SINGLE tile repeatedly (flood-filling a tiled multi-tile brush across
 // an irregular region isn't attempted) -- uses just the top-left cell of the current stamp.
 function floodFillAt(x0,y0){
   const rc=resolvedStampCells(); if(!rc) return;
   const layer=currentMapLayer();
-  const target=layer.tileId[cellIndex(x0,y0)];
+  const startIdx=cellIndex(x0,y0);
+  const targetTile=layer.tileId[startIdx], targetSrc=layer.srcLayer[startIdx];
   const cell=rc.cells[0];
-  if(target===cell.tileIdx) return;
+  if(targetTile===cell.tileIdx && targetSrc===activeTilesetLayer) return;
   const srcLayer=tilesetLayer(activeTilesetLayer);
   const tile=srcLayer.tiles[cell.tileIdx];
   const {palIdx}=resolveCellPalette(tile);
@@ -748,8 +893,8 @@ function floodFillAt(x0,y0){
     const [x,y]=stack.pop();
     if(x<0||y<0||x>=w||y>=h) continue;
     const idx=cellIndex(x,y);
-    if(layer.tileId[idx]!==target) continue;
-    layer.tileId[idx]=cell.tileIdx; layer.pal[idx]=palIdx; layer.flip[idx]=replFlip;
+    if(layer.tileId[idx]!==targetTile || layer.srcLayer[idx]!==targetSrc) continue;
+    layer.tileId[idx]=cell.tileIdx; layer.srcLayer[idx]=activeTilesetLayer; layer.pal[idx]=palIdx; layer.flip[idx]=replFlip;
     stack.push([x+1,y],[x-1,y],[x,y+1],[x,y-1]);
   }
 }
@@ -762,6 +907,52 @@ function canvasToCell(evt){
   const x=Math.floor(px/(TILE*zoom)), y=Math.floor(py/(TILE*zoom));
   return {x:clamp(x,0,mapState.mapW-1), y:clamp(y,0,mapState.mapH-1)};
 }
+// Extract/clear/write helpers -- shared by the map-select move-drag and the Copy/Cut/Paste/Clear
+// button handlers, all of which move or duplicate a rectangular block on the ACTIVE map layer.
+function extractBlock(layer,rect){
+  const w=rect.x1-rect.x0+1, h=rect.y1-rect.y0+1;
+  const tileId=new Int16Array(w*h), pal=new Int16Array(w*h), srcLayerArr=new Int16Array(w*h), flip=new Uint8Array(w*h);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    const si=cellIndex(rect.x0+x,rect.y0+y), di=y*w+x;
+    tileId[di]=layer.tileId[si]; pal[di]=layer.pal[si]; srcLayerArr[di]=layer.srcLayer[si]; flip[di]=layer.flip[si];
+  }
+  return {w,h,tileId,pal,srcLayer:srcLayerArr,flip};
+}
+function clearBlock(layer,rect){
+  for(let y=rect.y0;y<=rect.y1;y++)for(let x=rect.x0;x<=rect.x1;x++){
+    const i=cellIndex(x,y); layer.tileId[i]=-1; layer.srcLayer[i]=-1; layer.pal[i]=-1; layer.flip[i]=0;
+  }
+}
+function writeBlock(layer,buf,x0,y0){
+  for(let y=0;y<buf.h;y++)for(let x=0;x<buf.w;x++){
+    const dx=x0+x, dy=y0+y; if(!inBounds(dx,dy)) continue;
+    const si=y*buf.w+x, di=cellIndex(dx,dy);
+    layer.tileId[di]=buf.tileId[si]; layer.pal[di]=buf.pal[si]; layer.srcLayer[di]=buf.srcLayer[si]; layer.flip[di]=buf.flip[si];
+  }
+}
+function cellInSelection(c){
+  return selection && c.x>=selection.x0 && c.x<=selection.x1 && c.y>=selection.y0 && c.y<=selection.y1;
+}
+function spriteHitTest(x,y){
+  for(let i=mapState.sprites.length-1;i>=0;i--){
+    const s=mapState.sprites[i];
+    if(x>=s.x && x<s.x+s.w && y>=s.y && y<s.y+s.h) return i;
+  }
+  return -1;
+}
+// Snapshots the current stamp block into a standalone sprite instance -- placed sprites are a flat
+// list, not a grid cell, so overlapping placements never erase each other or the map underneath.
+function placeSprite(x,y){
+  const rc=resolvedStampCells(); if(!rc) return;
+  const srcLayer=tilesetLayer(activeTilesetLayer);
+  const cells=rc.cells.map(cell=>{
+    const tile=srcLayer.tiles[cell.tileIdx];
+    const {palIdx}=resolveCellPalette(tile);
+    return {tileIdx:cell.tileIdx, flipH:cell.flipH, flipV:cell.flipV, palIdx};
+  });
+  mapState.sprites.push({x,y,w:rc.w,h:rc.h,srcLayer:activeTilesetLayer,priority:spritePriority,cells});
+  selectedSpriteIdx=mapState.sprites.length-1;
+}
 function onDown(evt){
   if(!mapState) return;
   if(evt.button!==0 && evt.button!==2) return;
@@ -772,7 +963,35 @@ function onDown(evt){
   else if(tool==='eyedrop'){ eyedropAt(c.x,c.y); }
   else if(tool==='select'){
     if(evt.button===2){ selection=null; render(); return; }
-    dragStartCell={x:c.x,y:c.y}; selection={x0:c.x,y0:c.y,x1:c.x,y1:c.y}; drawing=true; render();
+    if(selection && cellInSelection(c)){
+      // Click landed inside the existing selection -- move it instead of redefining it (mirrors
+      // the Tile Editor's own click-inside-selection-to-move mechanic).
+      pushUndo();
+      const layer=currentMapLayer();
+      moveBuffer=extractBlock(layer,selection);
+      moveOrigin={x:selection.x0,y:selection.y0};
+      moveDragStart=c; moveOffset={dx:0,dy:0};
+      clearBlock(layer,selection);
+      drawing=true; render();
+    } else {
+      dragStartCell={x:c.x,y:c.y}; selection={x0:c.x,y0:c.y,x1:c.x,y1:c.y}; drawing=true; render();
+    }
+  }
+  else if(tool==='sprite'){
+    if(evt.button===2){ selectedSpriteIdx=-1; render(); renderSpriteList(); return; }
+    const hitIdx=spriteHitTest(c.x,c.y);
+    if(hitIdx>=0){
+      pushUndo();
+      selectedSpriteIdx=hitIdx;
+      const spr=mapState.sprites[hitIdx];
+      moveSpriteActive={idx:hitIdx,x:spr.x,y:spr.y};
+      spriteDragStart=c;
+      drawing=true; render(); renderSpriteList();
+    } else if(stampSel){
+      pushUndo();
+      placeSprite(c.x,c.y);
+      render(); scheduleAutosave(); renderSpriteList();
+    }
   }
 }
 function onMove(evt){
@@ -780,20 +999,47 @@ function onMove(evt){
   const c=canvasToCell(evt);
   document.getElementById('posInfo').textContent=`tile ${c.x},${c.y}`;
   if(!drawing){
-    if(tool==='stamp' && stampSel){ stampHoverCell=c; render(); }
+    if((tool==='stamp'||tool==='sprite') && stampSel){ stampHoverCell=c; render(); }
     else if(stampHoverCell){ stampHoverCell=null; render(); }
     return;
   }
   if(tool==='stamp'){ stampHoverCell=c; stampAt(c.x,c.y); render(); }
   else if(tool==='erase'){ eraseAt(c.x,c.y); render(); }
   else if(tool==='select'){
-    selection={x0:Math.min(dragStartCell.x,c.x),y0:Math.min(dragStartCell.y,c.y),
-               x1:Math.max(dragStartCell.x,c.x),y1:Math.max(dragStartCell.y,c.y)};
+    if(moveBuffer){
+      moveOffset={dx:c.x-moveDragStart.x, dy:c.y-moveDragStart.y};
+      render();
+    } else {
+      selection={x0:Math.min(dragStartCell.x,c.x),y0:Math.min(dragStartCell.y,c.y),
+                 x1:Math.max(dragStartCell.x,c.x),y1:Math.max(dragStartCell.y,c.y)};
+      render();
+    }
+  }
+  else if(tool==='sprite' && moveSpriteActive){
+    const spr=mapState.sprites[moveSpriteActive.idx];
+    const dx=c.x-spriteDragStart.x, dy=c.y-spriteDragStart.y;
+    moveSpriteActive.x=clamp(spr.x+dx,0,mapState.mapW-spr.w);
+    moveSpriteActive.y=clamp(spr.y+dy,0,mapState.mapH-spr.h);
     render();
   }
 }
 function onUp(){
   if(drawing && (tool==='stamp'||tool==='erase')) scheduleAutosave();
+  if(tool==='select' && moveBuffer){
+    const layer=currentMapLayer();
+    const mx=clamp(moveOrigin.x+moveOffset.dx,0,mapState.mapW-moveBuffer.w);
+    const my=clamp(moveOrigin.y+moveOffset.dy,0,mapState.mapH-moveBuffer.h);
+    writeBlock(layer,moveBuffer,mx,my);
+    selection={x0:mx,y0:my,x1:mx+moveBuffer.w-1,y1:my+moveBuffer.h-1};
+    moveBuffer=null; moveOrigin=null; moveDragStart=null; moveOffset={dx:0,dy:0};
+    scheduleAutosave(); render();
+  }
+  if(tool==='sprite' && moveSpriteActive){
+    const spr=mapState.sprites[moveSpriteActive.idx];
+    spr.x=moveSpriteActive.x; spr.y=moveSpriteActive.y;
+    moveSpriteActive=null; spriteDragStart=null;
+    scheduleAutosave(); render(); renderSpriteList();
+  }
   drawing=false;
 }
 canvas.addEventListener('pointerdown',e=>{ e.preventDefault(); onDown(e); });
@@ -805,8 +1051,8 @@ canvas.addEventListener('pointerleave',()=>{ document.getElementById('posInfo').
 /* ---------- tools ---------- */
 function setTool(t){
   tool=t;
-  if(t!=='stamp' && stampHoverCell){ stampHoverCell=null; }
-  ['toolStamp','toolErase','toolFill','toolEyedrop','toolSelect'].forEach(id=>document.getElementById(id).classList.remove('active'));
+  if(t!=='stamp' && t!=='sprite' && stampHoverCell){ stampHoverCell=null; }
+  ['toolStamp','toolErase','toolFill','toolEyedrop','toolSelect','toolSprite'].forEach(id=>document.getElementById(id).classList.remove('active'));
   document.getElementById('tool'+t[0].toUpperCase()+t.slice(1)).classList.add('active');
   render();
 }
@@ -815,17 +1061,11 @@ document.getElementById('toolErase').onclick=()=>setTool('erase');
 document.getElementById('toolFill').onclick=()=>setTool('fill');
 document.getElementById('toolEyedrop').onclick=()=>setTool('eyedrop');
 document.getElementById('toolSelect').onclick=()=>setTool('select');
+document.getElementById('toolSprite').onclick=()=>setTool('sprite');
 
 document.getElementById('btnCopy').onclick=()=>{
   if(!selection){ modalAlert('Select a rectangle first.'); return; }
-  const layer=currentMapLayer();
-  const w=selection.x1-selection.x0+1, h=selection.y1-selection.y0+1;
-  const tileId=new Int16Array(w*h), pal=new Int16Array(w*h), flip=new Uint8Array(w*h);
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-    const si=cellIndex(selection.x0+x,selection.y0+y), di=y*w+x;
-    tileId[di]=layer.tileId[si]; pal[di]=layer.pal[si]; flip[di]=layer.flip[si];
-  }
-  clipboard={w,h,tileId,pal,flip};
+  clipboard=extractBlock(currentMapLayer(),selection);
 };
 document.getElementById('btnCut').onclick=()=>{
   document.getElementById('btnCopy').onclick.call(null);
@@ -835,25 +1075,14 @@ document.getElementById('btnPasteTool').onclick=()=>{
   if(!clipboard){ modalAlert('Nothing copied yet.'); return; }
   if(!selection){ modalAlert('Select where to paste (top-left of the selection is used).'); return; }
   pushUndo();
-  const layer=currentMapLayer();
-  for(let y=0;y<clipboard.h;y++)for(let x=0;x<clipboard.w;x++){
-    const dx=selection.x0+x, dy=selection.y0+y;
-    if(!inBounds(dx,dy)) continue;
-    const di=cellIndex(dx,dy), si=y*clipboard.w+x;
-    layer.tileId[di]=clipboard.tileId[si]; layer.pal[di]=clipboard.pal[si]; layer.flip[di]=clipboard.flip[si];
-  }
+  writeBlock(currentMapLayer(),clipboard,selection.x0,selection.y0);
   render(); scheduleAutosave();
 };
 document.getElementById('btnClearSel').onclick=()=>{
   pushUndo();
   const layer=currentMapLayer();
-  if(selection){
-    for(let y=selection.y0;y<=selection.y1;y++)for(let x=selection.x0;x<=selection.x1;x++){
-      const i=cellIndex(x,y); layer.tileId[i]=-1; layer.pal[i]=-1; layer.flip[i]=0;
-    }
-  } else {
-    layer.tileId.fill(-1); layer.pal.fill(-1); layer.flip.fill(0);
-  }
+  if(selection) clearBlock(layer,selection);
+  else { layer.tileId.fill(-1); layer.srcLayer.fill(-1); layer.pal.fill(-1); layer.flip.fill(0); }
   render(); scheduleAutosave();
 };
 document.getElementById('btnUndo').onclick=undo;
@@ -868,6 +1097,11 @@ document.addEventListener('keydown',e=>{
     case 'f': setTool('fill'); break;
     case 'i': setTool('eyedrop'); break;
     case 's': setTool('select'); break;
+    case 'p': setTool('sprite'); break;
+    case 'delete': case 'backspace':
+      if(tool==='sprite' && selectedSpriteIdx>=0){ deleteSprite(selectedSpriteIdx); }
+      else document.getElementById('btnClearSel').click();
+      break;
     case 'h': if(e.shiftKey) document.getElementById('btnFlipH').click(); break;
     case 'v': if(e.shiftKey) document.getElementById('btnFlipV').click(); break;
     case 'z': if(e.ctrlKey||e.metaKey){ e.preventDefault(); e.shiftKey?redo():undo(); } break;
@@ -901,7 +1135,8 @@ function serializeMap(){
     mapW: mapState?mapState.mapW:32, mapH: mapState?mapState.mapH:32,
     activeMapLayer,
     layers: mapState ? mapState.layers.map(l=>({name:l.name, visible:l.visible,
-      tileId:Array.from(l.tileId), pal:Array.from(l.pal), flip:Array.from(l.flip)})) : [],
+      tileId:Array.from(l.tileId), srcLayer:Array.from(l.srcLayer), pal:Array.from(l.pal), flip:Array.from(l.flip)})) : [],
+    sprites: mapState ? mapState.sprites.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,srcLayer:s.srcLayer,priority:s.priority,cells:s.cells})) : [],
   };
 }
 document.getElementById('btnSaveMap').onclick=()=>{
@@ -930,10 +1165,10 @@ document.getElementById('fileLoadMap').onchange=(e)=>{
     } else { tileset=null; document.getElementById('tilesetInfo').textContent='no tileset imported'; }
     activeTilesetLayer=0; stampSel=null; activeMapLayer=clamp(obj.activeMapLayer||0,0,obj.layers.length-1);
     mapState={ name:obj.name, mapW:obj.mapW, mapH:obj.mapH,
-      layers: obj.layers.map(l=>({name:l.name, visible:l.visible!==false,
-        tileId:Int16Array.from(l.tileId), pal:Int16Array.from(l.pal), flip:Uint8Array.from(l.flip)})) };
-    selection=null; undoStack.length=0; redoStack.length=0;
-    renderTilesetLayerTabs(); renderStampPaletteOptions(); renderAllLayerUI();
+      layers: normalizeLoadedLayers(obj.layers, obj.mapW, obj.mapH),
+      sprites: Array.isArray(obj.sprites) ? obj.sprites.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,srcLayer:s.srcLayer,priority:s.priority,cells:s.cells})) : [] };
+    selection=null; selectedSpriteIdx=-1; undoStack.length=0; redoStack.length=0;
+    renderTilesetLayerTabs(); renderStampPaletteOptions(); renderAllLayerUI(); renderSpriteList();
     syncMapInputs(); renderTilesetCanvas(); renderStampPreview(); updateTileInfo(); render(); scheduleAutosave();
   };
   reader.readAsText(file);
@@ -966,8 +1201,8 @@ function tryRestoreAutosave(){
     }
     activeMapLayer=clamp(obj.activeMapLayer||0,0,obj.layers.length-1);
     mapState={ name:obj.name, mapW:obj.mapW, mapH:obj.mapH,
-      layers: obj.layers.map(l=>({name:l.name, visible:l.visible!==false,
-        tileId:Int16Array.from(l.tileId), pal:Int16Array.from(l.pal), flip:Uint8Array.from(l.flip)})) };
+      layers: normalizeLoadedLayers(obj.layers, obj.mapW, obj.mapH),
+      sprites: Array.isArray(obj.sprites) ? obj.sprites.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,srcLayer:s.srcLayer,priority:s.priority,cells:s.cells})) : [] };
     return true;
   }catch(e){ return false; }
 }
@@ -996,16 +1231,24 @@ function generateCode(onlyLayerIdx){
   lines.push('');
   layerIndices.forEach(li=>{
     const layer=mapState.layers[li];
-    const srcLayer=tileset.layers[li];
     const lname=sanitizeIdent(layer.name);
+    // A plane's cells can now come from ANY tileset layer, so tiles are deduped/keyed by the
+    // (srcLayer,tileId) pair rather than by tileId alone -- two different source layers can
+    // reuse the same numeric tile index for unrelated art.
     const used=new Set();
-    for(let i=0;i<layer.tileId.length;i++) if(layer.tileId[i]>=0) used.add(layer.tileId[i]);
-    const usedList=[...used].sort((a,b)=>a-b);
-    const remap=new Map(usedList.map((orig,ni)=>[orig,ni]));
+    for(let i=0;i<layer.tileId.length;i++){
+      const t=layer.tileId[i]; if(t<0) continue;
+      const sl=layer.srcLayer[i];
+      if(!tileset.layers[sl] || !tileset.layers[sl].tiles[t]) continue;
+      used.add(sl+':'+t);
+    }
+    const usedList=[...used].sort((a,b)=>{ const[as,at]=a.split(':').map(Number),[bs,bt]=b.split(':').map(Number); return as-bs||at-bt; });
+    const remap=new Map(usedList.map((key,ni)=>[key,ni]));
     lines.push(`/* ---- Layer ${li}: "${layer.name}" (${usedList.length} unique tile(s) used) ---- */`);
     const tileWords=[];
-    usedList.forEach(origIdx=>{
-      const tile=srcLayer.tiles[origIdx];
+    usedList.forEach(key=>{
+      const [sl,t]=key.split(':').map(Number);
+      const tile=tileset.layers[sl].tiles[t];
       for(let r=0;r<TILE;r++) tileWords.push('0x'+packRowFor(tile,false,false,r).toString(16).toUpperCase().padStart(4,'0'));
     });
     lines.push(`static const u16 ${far}${name}_${lname}_tiles[] = {`);
@@ -1015,9 +1258,11 @@ function generateCode(onlyLayerIdx){
     const mapTiles=[], mapPals=[], mapFlip=[];
     for(let i=0;i<layer.tileId.length;i++){
       const t=layer.tileId[i];
-      if(t<0){ mapTiles.push(0); mapPals.push(0); mapFlip.push(0); continue; }
-      mapTiles.push(remap.get(t));
-      const palIdx = layer.pal[i]>=0 ? layer.pal[i] : srcLayer.tiles[t].defaultPalette;
+      const sl=layer.srcLayer[i];
+      const srcTileset = t>=0 ? tileset.layers[sl] : null;
+      if(t<0 || !srcTileset || !srcTileset.tiles[t]){ mapTiles.push(0); mapPals.push(0); mapFlip.push(0); continue; }
+      mapTiles.push(remap.get(sl+':'+t));
+      const palIdx = layer.pal[i]>=0 ? layer.pal[i] : srcTileset.tiles[t].defaultPalette;
       mapPals.push(clamp(palIdx,0,15));
       mapFlip.push(layer.flip[i]&3);
     }
@@ -1097,6 +1342,7 @@ function setupLightModeToggle(){
   renderTilesetLayerTabs();
   renderStampPaletteOptions();
   renderAllLayerUI();
+  renderSpriteList();
   syncMapInputs();
   renderTilesetCanvas();
   renderStampPreview();
