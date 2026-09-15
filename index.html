@@ -2423,26 +2423,41 @@ document.getElementById('btnClearRef').onclick=()=>{
 };
 async function importImage(img){
   const scalePct=clamp(parseFloat(document.getElementById('importScalePct').value)||100, 1, 1000);
-  const srcW=Math.max(1,Math.round(img.width*scalePct/100));
-  const srcH=Math.max(1,Math.round(img.height*scalePct/100));
+  let srcW=Math.max(1,Math.round(img.width*scalePct/100));
+  let srcH=Math.max(1,Math.round(img.height*scalePct/100));
   let tw=Math.ceil(srcW/TILE), th=Math.ceil(srcH/TILE);
-  let cropWarn='';
+  let resampled = scalePct!==100;
   if(tw>MAX_GRID_TILES || th>MAX_GRID_TILES){
-    cropWarn=`\n\nThis image is ${tw}x${th} tiles${scalePct!==100?' after scaling':''}, larger than the ${MAX_GRID_TILES}x${MAX_GRID_TILES}-tile editing limit -- it will be cropped to the top-left ${Math.min(tw,MAX_GRID_TILES)}x${Math.min(th,MAX_GRID_TILES)} tiles.`;
-    tw=Math.min(tw,MAX_GRID_TILES); th=Math.min(th,MAX_GRID_TILES);
+    // Oversized (after the user's own Import Scale % above) -- ask whether to crop to the
+    // top-left corner (keeps every remaining pixel 1:1) or scale the whole image down to fit
+    // (keeps the whole picture, at reduced detail), rather than silently always cropping.
+    const cropTw=Math.min(tw,MAX_GRID_TILES), cropTh=Math.min(th,MAX_GRID_TILES);
+    const fitScale=Math.min(MAX_GRID_TILES*TILE/srcW, MAX_GRID_TILES*TILE/srcH);
+    const fitW=Math.max(1,Math.round(srcW*fitScale)), fitH=Math.max(1,Math.round(srcH*fitScale));
+    const fitTw=Math.ceil(fitW/TILE), fitTh=Math.ceil(fitH/TILE);
+    const sizeChoice=await showModal(
+      `This image is ${tw}x${th} tiles${scalePct!==100?' after your Import Scale %':''}, larger than the ${MAX_GRID_TILES}x${MAX_GRID_TILES}-tile editing limit. How should it be brought into range?`,
+      [
+        {label:'Cancel Import',value:'cancel'},
+        {label:`Crop to Top-Left ${cropTw}x${cropTh}`,value:'crop'},
+        {label:`Scale to Fit ${fitTw}x${fitTh}`,value:'fit',primary:true},
+      ]);
+    if(sizeChoice==='cancel') return;
+    if(sizeChoice==='fit'){ srcW=fitW; srcH=fitH; tw=fitTw; th=fitTh; resampled=true; }
+    else { tw=cropTw; th=cropTh; }
   }
   const w=tw*TILE, h=th*TILE;
   const off=document.createElement('canvas'); off.width=w; off.height=h;
   const octx=off.getContext('2d');
-  octx.imageSmoothingEnabled = scalePct!==100; // only resample when actually scaling; keep a crisp 1:1 blit otherwise
-  octx.drawImage(img,0,0,srcW,srcH); // scales to srcW/srcH (if scalePct!=100) then crops to the top-left tile-aligned canvas
+  octx.imageSmoothingEnabled = resampled; // only resample when actually scaling; keep a crisp 1:1 blit (including a plain crop) otherwise
+  octx.drawImage(img,0,0,srcW,srcH); // scales to srcW/srcH, then a still-oversized draw crops to the top-left tile-aligned canvas
   const data=octx.getImageData(0,0,w,h).data;
 
   const twoLayer=document.getElementById('chkTwoLayer').checked;
   const replaceMsg = twoLayer
     ? 'This will replace ALL layers with two fresh layers, SCR_1 and SCR_2.'
     : 'This will replace the active layer\'s content.';
-  const choice=await showModal(replaceMsg+cropWarn,[
+  const choice=await showModal(replaceMsg,[
     {label:'Cancel Import',value:'cancel'},
     {label:'Use Current Palette',value:'current'},
     {label:'Extract New Palette',value:'extract',primary:true},
