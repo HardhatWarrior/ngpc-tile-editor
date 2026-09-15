@@ -168,6 +168,7 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
     <div class="row">
       <button id="btnImportPng">Import PNG</button>
       <input id="fileImportPng" type="file" accept="image/png" style="display:none">
+      <button id="btnPasteImage" title="Paste an image from the clipboard (copied from anywhere) straight into the same import flow as Import PNG. Ctrl+V on the canvas also works when there's an image on the clipboard.">Paste Image</button>
       <label class="chk" title="Only used by the 'Auto Palette Per Tile' import choice (and by Generate Palettes Per Tile below): caps how many new palettes it may create. If more distinct tile color-sets than this exist, the most similar ones are merged and affected tiles use the nearest surviving palette instead of their exact colors. Leave blank for no cap. Applies per-layer when Split into 2 Layers was also checked at import time.">
         Max palettes <input id="importMaxPalettes" type="number" min="1" max="256" step="1" style="width:52px" placeholder="&#8734;">
       </label>
@@ -2210,7 +2211,8 @@ window.addEventListener('keydown',(e)=>{
   if(e.ctrlKey && e.key.toLowerCase()==='z'){ e.preventDefault(); undo(); return; }
   if(e.ctrlKey && (e.key.toLowerCase()==='y' || (e.shiftKey && e.key.toLowerCase()==='z'))){ e.preventDefault(); redo(); return; }
   if(e.ctrlKey && e.key.toLowerCase()==='c'){ e.preventDefault(); document.getElementById('btnCopy').click(); return; }
-  if(e.ctrlKey && e.key.toLowerCase()==='v'){ e.preventDefault(); document.getElementById('btnPasteTool').click(); return; }
+  // Ctrl+V is handled entirely by the 'paste' event listener below (it can distinguish an
+  // OS-clipboard image from a plain paste, which a keydown handler alone can't) -- no case here.
   if(e.key==='Delete'){
     e.preventDefault();
     if(pixelMask && (tool==='wand'||tool==='wandpaste')){
@@ -2451,6 +2453,59 @@ document.getElementById('fileImportPng').onchange=(e)=>{
   reader.readAsDataURL(file);
   e.target.value='';
 };
+
+/* ---------- paste an image straight onto the canvas (clipboard, not a file) ---------- */
+// Reuses the exact same importImage(img) pipeline as Import PNG (options modal, oversize
+// crop/fit, palette-method modal) -- a pasted image is just a file-less import.
+function loadImageFromBlob(blob){
+  return new Promise((resolve,reject)=>{
+    const img=new Image();
+    img.onload=()=>{ URL.revokeObjectURL(img.src); resolve(img); };
+    img.onerror=()=>{ URL.revokeObjectURL(img.src); reject(new Error('Could not decode that clipboard image.')); };
+    img.src=URL.createObjectURL(blob);
+  });
+}
+// Native paste event: fires on Ctrl+V (and a long-press "Paste" on touch). Checked FIRST for an
+// image so this can fall back to the app's own tile clipboard (btnPasteTool) when there isn't
+// one -- deliberately the only place Ctrl+V is handled (see the keydown handler above).
+document.addEventListener('paste', async (e)=>{
+  const inField=['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName);
+  if(inField) return; // let normal text paste work in the project-name/group-name fields etc.
+  const items=e.clipboardData && e.clipboardData.items;
+  let imageItem=null;
+  if(items){ for(const item of items){ if(item.type && item.type.startsWith('image/')){ imageItem=item; break; } } }
+  e.preventDefault();
+  if(imageItem){
+    const blob=imageItem.getAsFile();
+    if(blob){ try{ importImage(await loadImageFromBlob(blob)); }catch(err){ modalAlert(err.message); } }
+    return;
+  }
+  document.getElementById('btnPasteTool').click();
+});
+// Explicit button (async Clipboard API) -- the reliable path on touch/tablet, where there's no
+// physical Ctrl+V, and a clearer trigger everywhere else too.
+async function pasteImageFromClipboard(){
+  if(!navigator.clipboard || !navigator.clipboard.read){
+    await modalAlert('This browser doesn\'t support reading images from the clipboard via a button. Try Ctrl+V on the canvas instead, or use Import PNG.');
+    return;
+  }
+  try{
+    const items=await navigator.clipboard.read();
+    for(const item of items){
+      const imgType=item.types.find(t=>t.startsWith('image/'));
+      if(imgType){
+        const blob=await item.getType(imgType);
+        importImage(await loadImageFromBlob(blob));
+        return;
+      }
+    }
+    await modalAlert('No image found on the clipboard. Copy an image first, then try Paste Image again.');
+  }catch(err){
+    await modalAlert('Could not read the clipboard -- the browser may be blocking access here (try clicking the page first, or check this site\'s clipboard permission). '+err.message);
+  }
+}
+document.getElementById('btnPasteImage').onclick=pasteImageFromClipboard;
+
 document.getElementById('btnGeneratePerTile').onclick=async ()=>{
   const layer=currentLayer();
   if(!layer.refRGBA){ await modalAlert('The active layer has no full-color reference to convert -- import a PNG with the "Full Color (No Palette)" choice first, crop/resize it into place, then run this.'); return; }
