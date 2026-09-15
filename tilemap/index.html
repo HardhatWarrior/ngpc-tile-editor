@@ -122,7 +122,7 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
   <div id="left">
     <div class="panel">
       <h2>Tileset</h2>
-      <div class="hint">Import a project <code>.json</code> saved from the NGPC Tile Editor. Pick which tileset layer to stamp FROM with the tabs below, independent of which map layer (SCR_1/SCR_2) you're stamping ONTO. Click a tile below, or drag to select a rectangular block of tiles to stamp as one unit.</div>
+      <div class="hint">Import a project <code>.json</code> saved from the NGPC Tile Editor. Pick which tileset layer to stamp FROM with the tabs below, independent of which map layer (Layer 1/Layer 2) you're stamping ONTO. Click a tile below, or drag to select a rectangular block of tiles to stamp as one unit.</div>
       <div class="row" style="margin-top:6px" id="tilesetLayerTabs"></div>
       <div class="row" style="margin-top:6px;align-items:flex-start">
         <canvas id="tilesetCanvas" width="128" height="128"></canvas>
@@ -188,7 +188,7 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
     <div class="panel">
       <h2>Map Layers</h2>
       <div class="layerList" id="mapLayerList"></div>
-      <div class="hint" style="margin-top:4px">Always exactly SCR_1 (back) and SCR_2 (front), regardless of how many tileset layers are imported -- each cell remembers which tileset layer its tile came from.</div>
+      <div class="hint" style="margin-top:4px">Always exactly Layer 1 and Layer 2, regardless of how many tileset layers are imported. Assign each one to SCR_1 (back) or SCR_2 (front) with its dropdown -- each cell also remembers which tileset layer its tile came from.</div>
     </div>
 
     <div class="panel">
@@ -330,14 +330,26 @@ function currentMapLayer(){ return mapState.layers[activeMapLayer]; }
 function tilesetLayer(i){ return tileset.layers[i]; }
 
 // Every map cell remembers WHICH tileset layer its tile came from (srcLayer), not just a tile
-// index -- this decouples the 2 fixed map planes (SCR_1/SCR_2) from however many tileset layers
-// happen to be imported, so either plane can freely mix tiles from any tileset layer.
-function makeMapLayer(name,w,h){
-  return { name, visible:true,
+// index -- this decouples the 2 fixed map planes from however many tileset layers happen to be
+// imported, so either plane can freely mix tiles from any tileset layer.
+// The layer's display NAME (Layer 1/Layer 2) is separate from its scrTarget (SCR_1/SCR_2) --
+// the name is just a fixed generic label, scrTarget is the user-assignable hardware plane that
+// controls both render/export order and which array names come out in the generated C.
+function makeMapLayer(name,scrTarget,w,h){
+  return { name, scrTarget, visible:true,
     tileId:new Int16Array(w*h).fill(-1),
     srcLayer:new Int16Array(w*h).fill(-1), // tileset.layers[] index this cell's tile came from, -1=empty
     pal:new Int16Array(w*h).fill(-1),
     flip:new Uint8Array(w*h) };
+}
+function scrLayer(target){ return mapState.layers.find(l=>l.scrTarget===target); }
+// Swaps the OTHER layer's target when one layer is assigned a target the other already holds --
+// with exactly 2 layers and 2 hardware planes, this keeps the assignment always a valid 1:1
+// mapping with no "both layers on SCR_1" dead state to design around.
+function setLayerScrTarget(layer,target){
+  const other=mapState.layers.find(l=>l!==layer);
+  if(other && other.scrTarget===target) other.scrTarget = layer.scrTarget;
+  layer.scrTarget=target;
 }
 function resizeMapTo(newW,newH){
   const oldW=mapState.mapW, oldH=mapState.mapH;
@@ -352,23 +364,25 @@ function resizeMapTo(newW,newH){
   });
   mapState.mapW=newW; mapState.mapH=newH;
 }
-// Fills in srcLayer for map data saved before this field existed: assumes the old rigid 1:1
-// map-layer<->tileset-layer pairing that was in effect at the time (map layer i <- tileset layer i).
+// Fills in srcLayer/scrTarget for map data saved before those fields existed: assumes the old
+// rigid pairing that was in effect at the time (map layer i <- tileset layer i, and layer 0/1
+// named literally "SCR_1"/"SCR_2" which is how scrTarget is recovered for old saves).
 function normalizeLoadedLayers(rawLayers,w,h){
   const base=rawLayers.map((l,i)=>{
     const tileId=Int16Array.from(l.tileId);
     const srcLayer = l.srcLayer ? Int16Array.from(l.srcLayer) : tileId.map(t=>t>=0?i:-1);
-    return { name:l.name, visible:l.visible!==false, tileId, srcLayer,
+    const scrTarget = l.scrTarget || (l.name==='SCR_2' ? 'SCR_2' : (i===0?'SCR_1':'SCR_2'));
+    return { name:'Layer '+(i+1), scrTarget, visible:l.visible!==false, tileId, srcLayer,
       pal:Int16Array.from(l.pal), flip:Uint8Array.from(l.flip) };
   });
-  while(base.length<2) base.push(makeMapLayer(base.length===0?'SCR_1':'SCR_2',w,h));
+  while(base.length<2) base.push(makeMapLayer('Layer '+(base.length+1), base.length===0?'SCR_1':'SCR_2', w,h));
   return base;
 }
 
 /* ---------- undo/redo ---------- */
 function snapshotMap(){
   return { mapW:mapState.mapW, mapH:mapState.mapH,
-    layers: mapState.layers.map(l=>({name:l.name,visible:l.visible,
+    layers: mapState.layers.map(l=>({name:l.name,scrTarget:l.scrTarget,visible:l.visible,
       tileId:l.tileId.slice(), srcLayer:l.srcLayer.slice(), pal:l.pal.slice(), flip:l.flip.slice()})),
     sprites: mapState.sprites.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,srcLayer:s.srcLayer,priority:s.priority,
       cells:s.cells.map(c=>({...c}))})) };
@@ -380,7 +394,7 @@ function pushUndo(){
 }
 function applySnapshot(s){
   mapState.mapW=s.mapW; mapState.mapH=s.mapH;
-  mapState.layers=s.layers.map(l=>({name:l.name,visible:l.visible,
+  mapState.layers=s.layers.map(l=>({name:l.name,scrTarget:l.scrTarget,visible:l.visible,
     tileId:l.tileId.slice(), srcLayer:l.srcLayer.slice(), pal:l.pal.slice(), flip:l.flip.slice()}));
   mapState.sprites=s.sprites.map(spr=>({x:spr.x,y:spr.y,w:spr.w,h:spr.h,srcLayer:spr.srcLayer,priority:spr.priority,
     cells:spr.cells.map(c=>({...c}))}));
@@ -392,12 +406,13 @@ function undo(){ if(!undoStack.length)return; redoStack.push(snapshotMap()); app
 function redo(){ if(!redoStack.length)return; undoStack.push(snapshotMap()); applySnapshot(redoStack.pop()); }
 
 /* ---------- New / reset ---------- */
-// The map ALWAYS has exactly 2 planes (SCR_1, SCR_2), regardless of how many layers the imported
-// tileset has -- each map cell records its OWN srcLayer, so either plane can freely mix tiles
-// pulled from any tileset layer.
+// The map ALWAYS has exactly 2 layers (Layer 1, Layer 2), regardless of how many layers the
+// imported tileset has -- each map cell records its OWN srcLayer, so either plane can freely mix
+// tiles pulled from any tileset layer. Layer 1/Layer 2 default to SCR_1/SCR_2 but either can be
+// individually reassigned to the other hardware plane via the Map Layers panel.
 function freshMap(w,h){
   return { name:'my_map', mapW:w, mapH:h,
-    layers: [makeMapLayer('SCR_1',w,h), makeMapLayer('SCR_2',w,h)],
+    layers: [makeMapLayer('Layer 1','SCR_1',w,h), makeMapLayer('Layer 2','SCR_2',w,h)],
     sprites: [] };
 }
 document.getElementById('btnNewMap').onclick=async ()=>{
@@ -620,6 +635,12 @@ function renderAllLayerUI(){
     row.className='layerRow'+(i===activeMapLayer?' active':'');
     row.innerHTML=`<input type="checkbox" ${l.visible?'checked':''}> <span style="flex:1">${l.name}</span>`;
     row.querySelector('input').onclick=e=>{ e.stopPropagation(); l.visible=e.target.checked; render(); scheduleAutosave(); };
+    const sel=document.createElement('select');
+    sel.innerHTML='<option value="SCR_1">SCR_1 (back)</option><option value="SCR_2">SCR_2 (front)</option>';
+    sel.value=l.scrTarget;
+    sel.onclick=e=>e.stopPropagation();
+    sel.onchange=e=>{ setLayerScrTarget(l,e.target.value); renderAllLayerUI(); render(); scheduleAutosave(); };
+    row.appendChild(sel);
     row.onclick=()=>{ activeMapLayer=i; renderAllLayerUI(); renderBudget(); render(); };
     wrap.appendChild(row);
   });
@@ -639,7 +660,7 @@ function renderBudget(){
       usedPals.add(p);
     }
     const tOver = usedTiles.size>FREE_TILE_SLOTS, pOver = usedPals.size>MAX_PALETTES_PER_PLANE;
-    return `"${l.name}": ${usedTiles.size} unique tile(s) `+
+    return `"${l.name}" (${l.scrTarget}): ${usedTiles.size} unique tile(s) `+
       `<span class="${tOver?'statBad':'statOk'}">${tOver?'(over the ~'+FREE_TILE_SLOTS+' free budget!)':'(ok)'}</span>, `+
       `${usedPals.size} palette(s) `+
       `<span class="${pOver?'statBad':'statOk'}">${pOver?'(over the '+MAX_PALETTES_PER_PLANE+'-palette limit!)':'(ok)'}</span>`;
@@ -761,8 +782,13 @@ function render(){
       }
     });
   }
+  // Draw order follows each layer's scrTarget (SCR_1 back, SCR_2 front), NOT array order --
+  // either Layer 1 or Layer 2 can be assigned to either plane via the Map Layers panel.
+  const backLayer=scrLayer('SCR_1'), frontLayer=scrLayer('SCR_2');
   drawSpriteGroup('behind');
-  mapState.layers.forEach((layer,li)=>{ drawMapLayer(layer,li); if(li===0) drawSpriteGroup('middle'); });
+  drawMapLayer(backLayer, mapState.layers.indexOf(backLayer));
+  drawSpriteGroup('middle');
+  drawMapLayer(frontLayer, mapState.layers.indexOf(frontLayer));
   drawSpriteGroup('front');
   ctx.globalAlpha=1;
 
@@ -1134,7 +1160,7 @@ function serializeMap(){
     } : null,
     mapW: mapState?mapState.mapW:32, mapH: mapState?mapState.mapH:32,
     activeMapLayer,
-    layers: mapState ? mapState.layers.map(l=>({name:l.name, visible:l.visible,
+    layers: mapState ? mapState.layers.map(l=>({name:l.name, scrTarget:l.scrTarget, visible:l.visible,
       tileId:Array.from(l.tileId), srcLayer:Array.from(l.srcLayer), pal:Array.from(l.pal), flip:Array.from(l.flip)})) : [],
     sprites: mapState ? mapState.sprites.map(s=>({x:s.x,y:s.y,w:s.w,h:s.h,srcLayer:s.srcLayer,priority:s.priority,cells:s.cells})) : [],
   };
@@ -1223,15 +1249,19 @@ function generateCode(onlyLayerIdx){
   const far=document.getElementById('chkFar').checked?'NGP_FAR ':'';
   if(!mapState || !tileset) return '/* Import a tileset and build a map first. */';
   const lines=[];
-  const layerIndices = (onlyLayerIdx===undefined||onlyLayerIdx===null) ? mapState.layers.map((_,i)=>i) : [onlyLayerIdx];
-  const scopeNote = layerIndices.length<mapState.layers.length ? `, layer "${mapState.layers[layerIndices[0]].name}" only (self-contained -- includes the full shared palette table below)` : `, ${mapState.layers.length} layer(s)`;
+  // Export order follows scrTarget (SCR_1 then SCR_2), not array order -- either Layer 1 or
+  // Layer 2 can be assigned to either plane, but the generated arrays should always list SCR_1
+  // before SCR_2 regardless of which array slot holds which.
+  const allIndices=[...mapState.layers.keys()].sort((a,b)=> mapState.layers[a].scrTarget<mapState.layers[b].scrTarget?-1:1);
+  const layerIndices = (onlyLayerIdx===undefined||onlyLayerIdx===null) ? allIndices : [onlyLayerIdx];
+  const scopeNote = layerIndices.length<mapState.layers.length ? `, layer "${mapState.layers[layerIndices[0]].name}" (${mapState.layers[layerIndices[0]].scrTarget}) only (self-contained -- includes the full shared palette table below)` : `, ${mapState.layers.length} layer(s)`;
   lines.push(`/* Generated by NGPC Tilemap Editor. ${mapState.mapW}x${mapState.mapH} tile map${scopeNote}. */`);
   lines.push(`/* Consume with ngpc_gfx_put_tile_ex(plane, x, y, TILE_BASE + <layer>_map_tiles[i], <layer>_map_pals[i], <layer>_map_flip[i]&1, (<layer>_map_flip[i]>>1)&1) for each i = y*map_w+x. */`);
   lines.push(`/* The real SCR1/SCR2 VRAM tilemap is only 32x32 tiles at once -- for a bigger map, stream the visible 32x32 window from this array as the camera scrolls. */`);
   lines.push('');
   layerIndices.forEach(li=>{
     const layer=mapState.layers[li];
-    const lname=sanitizeIdent(layer.name);
+    const lname=sanitizeIdent(layer.scrTarget);
     // A plane's cells can now come from ANY tileset layer, so tiles are deduped/keyed by the
     // (srcLayer,tileId) pair rather than by tileId alone -- two different source layers can
     // reuse the same numeric tile index for unrelated art.
@@ -1244,7 +1274,7 @@ function generateCode(onlyLayerIdx){
     }
     const usedList=[...used].sort((a,b)=>{ const[as,at]=a.split(':').map(Number),[bs,bt]=b.split(':').map(Number); return as-bs||at-bt; });
     const remap=new Map(usedList.map((key,ni)=>[key,ni]));
-    lines.push(`/* ---- Layer ${li}: "${layer.name}" (${usedList.length} unique tile(s) used) ---- */`);
+    lines.push(`/* ---- "${layer.name}" -> ${layer.scrTarget} (${usedList.length} unique tile(s) used) ---- */`);
     const tileWords=[];
     usedList.forEach(key=>{
       const [sl,t]=key.split(':').map(Number);
@@ -1306,17 +1336,19 @@ document.getElementById('btnDownloadCode').onclick=()=>{
 document.getElementById('btnDownloadPerLayer').onclick=async ()=>{
   if(!mapState || !tileset){ await modalAlert('Import a tileset and build a map first.'); return; }
   const baseName=document.getElementById('mapName').value.trim()||'my_map';
-  mapState.layers.forEach((layer,li)=>{
+  const orderedIndices=[...mapState.layers.keys()].sort((a,b)=> mapState.layers[a].scrTarget<mapState.layers[b].scrTarget?-1:1);
+  orderedIndices.forEach((li,order)=>{
+    const layer=mapState.layers[li];
     const code=generateCode(li);
     const blob=new Blob([code],{type:'text/plain'});
     const url=URL.createObjectURL(blob);
     // staggered so multiple near-simultaneous downloads don't get coalesced/blocked by the browser
     setTimeout(()=>{
       const a=document.createElement('a');
-      a.href=url; a.download=`${baseName}_${sanitizeIdent(layer.name)}.c`;
+      a.href=url; a.download=`${baseName}_${sanitizeIdent(layer.scrTarget)}.c`;
       a.click();
       setTimeout(()=>URL.revokeObjectURL(url),2000);
-    }, li*350);
+    }, order*350);
   });
 };
 
