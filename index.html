@@ -589,7 +589,8 @@ function showImportOptionsModal(img){
     const extra=document.getElementById('modalExtra');
     extra.innerHTML=`
       <div class="row" style="margin-bottom:8px">
-        <label class="chk">Import scale <input id="modalScalePct" type="number" min="1" max="1000" step="1" value="100" style="width:60px">%</label>
+        <label class="chk">Import scale <input id="modalScalePct" type="number" min="1" step="1" value="100" style="width:60px">%</label>
+        <button id="modalScaleFit" type="button" title="Sets the scale to whatever maximizes this image within the 256x256-tile limit, preserving its aspect ratio.">Fit to 256x256</button>
       </div>
       <div class="hint statusText" id="modalScalePreview" style="margin-bottom:8px"></div>
       <label class="chk" style="margin-bottom:4px" title="Splits the import across two fresh layers, SCR_1 and SCR_2 (replacing whatever layers currently exist), so together they can show more colors per tile than one plane alone. Only affects the 'Extract New Palette' and 'Auto Palette Per Tile' choices on the next screen.">
@@ -598,13 +599,18 @@ function showImportOptionsModal(img){
     const scaleInput=document.getElementById('modalScalePct');
     const preview=document.getElementById('modalScalePreview');
     function updatePreview(){
-      const pct=clamp(parseFloat(scaleInput.value)||100,1,1000);
+      const pct=Math.max(1,parseFloat(scaleInput.value)||100);
       const w=Math.max(1,Math.round(img.width*pct/100)), h=Math.max(1,Math.round(img.height*pct/100));
       const tw=Math.ceil(w/TILE), th=Math.ceil(h/TILE);
       preview.textContent=`→ ${w}x${h}px (${tw}x${th} tiles)`+((tw>MAX_GRID_TILES||th>MAX_GRID_TILES)?` -- over the ${MAX_GRID_TILES}x${MAX_GRID_TILES}-tile limit, you'll get a crop/fit choice next`:'');
     }
     scaleInput.oninput=updatePreview;
     updatePreview();
+    document.getElementById('modalScaleFit').onclick=()=>{
+      const fitPct=Math.max(1,Math.floor(Math.min(MAX_GRID_TILES*TILE/img.width, MAX_GRID_TILES*TILE/img.height)*100));
+      scaleInput.value=fitPct;
+      updatePreview();
+    };
 
     const wrap=document.getElementById('modalButtons');
     wrap.innerHTML='';
@@ -618,7 +624,7 @@ function showImportOptionsModal(img){
     const btnCancel=document.createElement('button'); btnCancel.textContent='Cancel Import';
     btnCancel.onclick=()=>finish(null);
     const btnGo=document.createElement('button'); btnGo.textContent='Continue'; btnGo.className='primary';
-    btnGo.onclick=()=>finish({scalePct:clamp(parseFloat(scaleInput.value)||100,1,1000), twoLayer:document.getElementById('modalTwoLayer').checked});
+    btnGo.onclick=()=>finish({scalePct:Math.max(1,parseFloat(scaleInput.value)||100), twoLayer:document.getElementById('modalTwoLayer').checked});
     wrap.appendChild(btnCancel); wrap.appendChild(btnGo);
     function onKey(e){
       if(e.key==='Escape') finish(null);
