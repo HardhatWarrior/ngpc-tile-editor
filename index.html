@@ -167,13 +167,7 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
     <div class="row">
       <button id="btnImportPng">Import PNG</button>
       <input id="fileImportPng" type="file" accept="image/png" style="display:none">
-      <label class="chk" title="Resamples the raw source image to this percentage of its native size BEFORE any palette/quantization step runs (and before the tile-grid size is even decided) -- e.g. shrink a big photo to fit the tile budget, or enlarge a tiny sprite. 100 = original size. Applies to every import choice, including Full Color (No Palette).">
-        Import scale <input id="importScalePct" type="number" min="1" max="1000" step="1" value="100" style="width:52px">%
-      </label>
-      <label class="chk" title="Splits the import across two fresh layers, SCR_1 and SCR_2 (replacing whatever layers currently exist), so together they can show more colors per tile than one plane alone -- each tile's colors are split into two groups of up to 3, one per layer, with each layer transparent (index 0) wherever the OTHER layer is showing, so SCR_2 composites over SCR_1 for a richer image. Only affects the 'Extract New Palette' choice (one shared palette per layer) and 'Auto Palette Per Tile' (per-tile palettes per layer, honoring Max Palettes below, same as normal); 'Use Current Palette' and 'Full Color' ignore it.">
-        <input type="checkbox" id="chkTwoLayer"> Split into 2 layers (SCR_1/SCR_2)
-      </label>
-      <label class="chk" title="Only used by the 'Auto Palette Per Tile' import choice (and by Generate Palettes Per Tile below): caps how many new palettes it may create. If more distinct tile color-sets than this exist, the most similar ones are merged and affected tiles use the nearest surviving palette instead of their exact colors. Leave blank for no cap. Applies per-layer when Split into 2 Layers is also checked.">
+      <label class="chk" title="Only used by the 'Auto Palette Per Tile' import choice (and by Generate Palettes Per Tile below): caps how many new palettes it may create. If more distinct tile color-sets than this exist, the most similar ones are merged and affected tiles use the nearest surviving palette instead of their exact colors. Leave blank for no cap. Applies per-layer when Split into 2 Layers was also checked at import time.">
         Max palettes <input id="importMaxPalettes" type="number" min="1" max="256" step="1" style="width:52px" placeholder="&#8734;">
       </label>
       <button id="btnGeneratePerTile" title="Converts the active layer's full-color reference (loaded via the 'Full Color (No Palette)' import choice) into real indexed art -- runs the same per-tile auto-palette logic as importing, using the Max Palettes cap above. If you have a tile-aligned Select-tool selection active, only those tiles are (re)generated -- everything else is left alone. The reference stays visible in a side panel afterward for comparison; re-run any time (e.g. after selecting a region to touch up) to regenerate just that area.">Generate Palettes Per Tile</button>
@@ -501,6 +495,7 @@ label.chk{display:flex;align-items:center;gap:6px;cursor:pointer;}
 <div id="modalOverlay" class="modalOverlay" hidden>
   <div class="modalBox">
     <div id="modalMessage" class="modalMessage"></div>
+    <div id="modalExtra"></div>
     <div id="modalButtons" class="modalButtons"></div>
   </div>
 </div>
@@ -557,6 +552,7 @@ function showModal(message,buttons){
   return new Promise(resolve=>{
     const overlay=document.getElementById('modalOverlay');
     document.getElementById('modalMessage').textContent=message;
+    document.getElementById('modalExtra').innerHTML='';
     const wrap=document.getElementById('modalButtons');
     wrap.innerHTML='';
     let escapeValue=false;
@@ -580,6 +576,58 @@ function modalConfirm(message){
 }
 function modalAlert(message){
   return showModal(message,[{label:'OK',value:true,primary:true}]);
+}
+/* Import-options modal: shown right after a file is picked, so the scale % and 2-layer choice
+   are made with the actual source dimensions on screen instead of blind, ambient toolbar
+   settings decided before you know the image's size. Resolves to null on cancel, else
+   {scalePct, twoLayer}. Reuses the generic modal's overlay/message/buttons DOM but injects a
+   small custom control block into #modalExtra (kept empty by showModal for every other use). */
+function showImportOptionsModal(img){
+  return new Promise(resolve=>{
+    const overlay=document.getElementById('modalOverlay');
+    document.getElementById('modalMessage').textContent=`Source image is ${img.width}x${img.height}px.`;
+    const extra=document.getElementById('modalExtra');
+    extra.innerHTML=`
+      <div class="row" style="margin-bottom:8px">
+        <label class="chk">Import scale <input id="modalScalePct" type="number" min="1" max="1000" step="1" value="100" style="width:60px">%</label>
+      </div>
+      <div class="hint statusText" id="modalScalePreview" style="margin-bottom:8px"></div>
+      <label class="chk" style="margin-bottom:4px" title="Splits the import across two fresh layers, SCR_1 and SCR_2 (replacing whatever layers currently exist), so together they can show more colors per tile than one plane alone. Only affects the 'Extract New Palette' and 'Auto Palette Per Tile' choices on the next screen.">
+        <input type="checkbox" id="modalTwoLayer"> Split into 2 layers (SCR_1/SCR_2)
+      </label>`;
+    const scaleInput=document.getElementById('modalScalePct');
+    const preview=document.getElementById('modalScalePreview');
+    function updatePreview(){
+      const pct=clamp(parseFloat(scaleInput.value)||100,1,1000);
+      const w=Math.max(1,Math.round(img.width*pct/100)), h=Math.max(1,Math.round(img.height*pct/100));
+      const tw=Math.ceil(w/TILE), th=Math.ceil(h/TILE);
+      preview.textContent=`→ ${w}x${h}px (${tw}x${th} tiles)`+((tw>MAX_GRID_TILES||th>MAX_GRID_TILES)?` -- over the ${MAX_GRID_TILES}x${MAX_GRID_TILES}-tile limit, you'll get a crop/fit choice next`:'');
+    }
+    scaleInput.oninput=updatePreview;
+    updatePreview();
+
+    const wrap=document.getElementById('modalButtons');
+    wrap.innerHTML='';
+    let resolved=false;
+    function finish(val){
+      if(resolved) return; resolved=true;
+      overlay.hidden=true; document.removeEventListener('keydown',onKey);
+      extra.innerHTML='';
+      resolve(val);
+    }
+    const btnCancel=document.createElement('button'); btnCancel.textContent='Cancel Import';
+    btnCancel.onclick=()=>finish(null);
+    const btnGo=document.createElement('button'); btnGo.textContent='Continue'; btnGo.className='primary';
+    btnGo.onclick=()=>finish({scalePct:clamp(parseFloat(scaleInput.value)||100,1,1000), twoLayer:document.getElementById('modalTwoLayer').checked});
+    wrap.appendChild(btnCancel); wrap.appendChild(btnGo);
+    function onKey(e){
+      if(e.key==='Escape') finish(null);
+      else if(e.key==='Enter'){ e.preventDefault(); btnGo.onclick(); }
+    }
+    document.addEventListener('keydown',onKey);
+    overlay.hidden=false;
+    scaleInput.focus(); scaleInput.select();
+  });
 }
 
 let tool='pencil';
@@ -2422,7 +2470,9 @@ document.getElementById('btnClearRef').onclick=()=>{
   render(); scheduleAutosave();
 };
 async function importImage(img){
-  const scalePct=clamp(parseFloat(document.getElementById('importScalePct').value)||100, 1, 1000);
+  const opts=await showImportOptionsModal(img);
+  if(opts===null) return;
+  const scalePct=opts.scalePct, twoLayer=opts.twoLayer;
   let srcW=Math.max(1,Math.round(img.width*scalePct/100));
   let srcH=Math.max(1,Math.round(img.height*scalePct/100));
   let tw=Math.ceil(srcW/TILE), th=Math.ceil(srcH/TILE);
@@ -2453,7 +2503,6 @@ async function importImage(img){
   octx.drawImage(img,0,0,srcW,srcH); // scales to srcW/srcH, then a still-oversized draw crops to the top-left tile-aligned canvas
   const data=octx.getImageData(0,0,w,h).data;
 
-  const twoLayer=document.getElementById('chkTwoLayer').checked;
   const replaceMsg = twoLayer
     ? 'This will replace ALL layers with two fresh layers, SCR_1 and SCR_2.'
     : 'This will replace the active layer\'s content.';
